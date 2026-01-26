@@ -40,8 +40,8 @@ use gpui::{
 use language_model::{IconOrSvg, LanguageModel, LanguageModelProvider, LanguageModelRegistry};
 use project::{Project, ProjectItem, ProjectPath, Worktree};
 use prompt_store::{
-    ProjectContext, PromptStore, RULES_FILE_NAMES, RulesFileContext, UserRulesContext,
-    WorktreeContext,
+    ProjectContext, PromptStore, RULES_FILE_NAMES, RulesFileContext, SkillMetadata,
+    UserRulesContext, WorktreeContext,
 };
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, update_settings_file};
@@ -399,11 +399,15 @@ impl NativeAgent {
     ) -> Task<ProjectContext> {
         let worktrees = project.read(cx).visible_worktrees(cx).collect::<Vec<_>>();
         let worktree_tasks = worktrees
+            .clone()
             .into_iter()
             .map(|worktree| {
                 Self::load_worktree_info_for_system_prompt(worktree, project.clone(), cx)
             })
             .collect::<Vec<_>>();
+
+        let skills_task = Self::discover_skills_for_worktrees(&worktrees, project, cx);
+
         let default_user_rules_task = if let Some(prompt_store) = prompt_store.as_ref() {
             prompt_store.read_with(cx, |prompt_store, cx| {
                 let prompts = prompt_store.default_prompt_metadata();
@@ -418,8 +422,12 @@ impl NativeAgent {
         };
 
         cx.spawn(async move |_cx| {
-            let (worktrees, default_user_rules) =
-                future::join(future::join_all(worktree_tasks), default_user_rules_task).await;
+            let (worktrees, default_user_rules, available_skills) = future::join3(
+                future::join_all(worktree_tasks),
+                default_user_rules_task,
+                skills_task,
+            )
+            .await;
 
             let worktrees = worktrees
                 .into_iter()
@@ -453,7 +461,28 @@ impl NativeAgent {
                 })
                 .collect::<Vec<_>>();
 
-            ProjectContext::new(worktrees, default_user_rules)
+            ProjectContext::new(worktrees, default_user_rules, available_skills)
+        })
+    }
+
+    const SKILLS_DIRECTORY: &str = ".zed/skills";
+    const SKILL_FILE_NAME: &str = "SKILL.md";
+
+    fn discover_skills_for_worktrees(
+        worktrees: &[Entity<Worktree>],
+        project: &Entity<Project>,
+        cx: &mut App,
+    ) -> Task<Vec<SkillMetadata>> {
+        let skill_tasks: Vec<_> = worktrees
+            .iter()
+            .flat_map(|worktree| {
+                Self::discover_skills_in_worktree(worktree.clone(), project.clone(), cx)
+            })
+            .collect();
+
+        cx.spawn(async move |_cx| {
+            let results = future::join_all(skill_tasks).await;
+            results.into_iter().flatten().collect()
         })
     }
 
@@ -490,6 +519,120 @@ impl NativeAgent {
             context.rules_file = rules_file;
             (context, rules_file_error)
         })
+    }
+
+    /// Discovers skills within a single worktree's `.zed/skills/` directory.
+    /// Returns a Vec of Tasks, one for each potential skill directory found.
+    fn discover_skills_in_worktree(
+        worktree: Entity<Worktree>,
+        project: Entity<Project>,
+        cx: &mut App,
+    ) -> Vec<Task<Option<SkillMetadata>>> {
+        let tree = worktree.read(cx);
+        let worktree_id = tree.id();
+        let worktree_abs_path = tree.abs_path();
+
+        let skills_dir_path = match RelPath::unix(Self::SKILLS_DIRECTORY) {
+            Ok(path) => path,
+            Err(_) => return vec![],
+        };
+
+        let Some(skills_dir_entry) = tree.entry_for_path(&skills_dir_path) else {
+            return vec![];
+        };
+
+        if !skills_dir_entry.is_dir() {
+            return vec![];
+        }
+
+        let snapshot = tree.snapshot();
+
+        let skill_dirs = snapshot
+            .child_entries(&skills_dir_path)
+            .filter(|entry| entry.is_dir())
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        skill_dirs
+            .into_iter()
+            .filter_map(|skill_dir_path| {
+                let skill_file_path =
+                    skill_dir_path.join(&RelPath::unix(Self::SKILL_FILE_NAME).unwrap());
+
+                let entry = snapshot
+                    .entry_for_path(&skill_file_path)
+                    .filter(|e| e.is_file())?;
+
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                };
+
+                let abs_skill_path = worktree_abs_path
+                    .join(entry.path.as_std_path())
+                    .to_string_lossy()
+                    .to_string();
+
+                let buffer_task =
+                    project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+
+                let rope_task = cx.spawn(async move |cx| {
+                    let buffer = buffer_task.await.ok()?;
+                    let rope = buffer.read_with(cx, |buffer, _cx| buffer.as_rope().clone());
+                    Some(rope)
+                });
+
+                Some(cx.background_spawn(async move {
+                    let rope = rope_task.await?;
+                    let content = rope.to_string();
+                    let (name, description) = Self::parse_skill_frontmatter(&content)?;
+
+                    Some(SkillMetadata {
+                        name,
+                        description,
+                        skill_path: abs_skill_path,
+                    })
+                }))
+            })
+            .collect()
+    }
+
+    fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
+        let content = content.trim();
+
+        if !content.starts_with("---") {
+            return None;
+        }
+
+        let after_opening = &content[3..];
+        let closing_pos = after_opening.find("\n---")?;
+        let frontmatter = &after_opening[..closing_pos].trim();
+
+        let mut name: Option<String> = None;
+        let mut description: Option<String> = None;
+
+        for line in frontmatter.lines() {
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("name:") {
+                name = Some(
+                    value
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string(),
+                );
+            } else if let Some(value) = line.strip_prefix("description:") {
+                description = Some(
+                    value
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string(),
+                );
+            }
+        }
+
+        Some((name?, description?))
     }
 
     fn load_worktree_rules_file(
@@ -586,10 +729,15 @@ impl NativeAgent {
                 self.project_context_needs_refresh.send(()).ok();
             }
             project::Event::WorktreeUpdatedEntries(_, items) => {
+                let is_skills_dir_path = |path: &RelPath| {
+                    path.starts_with(RelPath::unix(Self::SKILLS_DIRECTORY).unwrap())
+                };
+
                 if items.iter().any(|(path, _, _)| {
                     RULES_FILE_NAMES
                         .iter()
                         .any(|name| path.as_ref() == RelPath::unix(name).unwrap())
+                        || is_skills_dir_path(path.as_ref())
                 }) {
                     self.project_context_needs_refresh.send(()).ok();
                 }
@@ -1679,6 +1827,27 @@ mod internal_tests {
                 }]
             )
         });
+
+        // Creating a skill updates the project context.
+        fs.insert_tree(
+            "/a/.zed/skills/test-skill",
+            json!({
+                "SKILL.md": "---\nname: test-skill\ndescription: A test skill\n---\n\n# Instructions\n..."
+            }),
+        )
+        .await;
+        cx.run_until_parked();
+        agent.read_with(cx, |agent, cx| {
+            let context = agent.project_context.read(cx);
+            assert_eq!(context.available_skills.len(), 1);
+            assert_eq!(context.available_skills[0].name, "test-skill");
+            assert_eq!(context.available_skills[0].description, "A test skill");
+            assert!(
+                context.available_skills[0]
+                    .skill_path
+                    .ends_with(".zed/skills/test-skill/SKILL.md")
+            );
+        });
     }
 
     #[gpui::test]
@@ -1956,6 +2125,25 @@ mod internal_tests {
                 "}
             )
         });
+    }
+
+    #[test]
+    fn test_parse_skill_frontmatter() {
+        let content = "---\nname: my-skill\ndescription: Does something\n---\n\n# Content";
+        let (name, desc) = NativeAgent::parse_skill_frontmatter(content).unwrap();
+        assert_eq!(name, "my-skill");
+        assert_eq!(desc, "Does something");
+
+        let content = "---\ndescription: Does something\n---\n";
+        assert!(NativeAgent::parse_skill_frontmatter(content).is_none());
+
+        let content = "# Just markdown";
+        assert!(NativeAgent::parse_skill_frontmatter(content).is_none());
+
+        let content = "---\nname: \"quoted-name\"\ndescription: 'single quoted'\n---\n";
+        let (name, desc) = NativeAgent::parse_skill_frontmatter(content).unwrap();
+        assert_eq!(name, "quoted-name");
+        assert_eq!(desc, "single quoted");
     }
 
     fn thread_entries(

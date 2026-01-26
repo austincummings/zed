@@ -43,13 +43,20 @@ pub struct ProjectContext {
     pub os: String,
     pub arch: String,
     pub shell: String,
+    pub available_skills: Vec<SkillMetadata>,
+    pub has_available_skills: bool,
 }
 
 impl ProjectContext {
-    pub fn new(worktrees: Vec<WorktreeContext>, default_user_rules: Vec<UserRulesContext>) -> Self {
+    pub fn new(
+        worktrees: Vec<WorktreeContext>,
+        default_user_rules: Vec<UserRulesContext>,
+        available_skills: Vec<SkillMetadata>,
+    ) -> Self {
         let has_rules = worktrees
             .iter()
             .any(|worktree| worktree.rules_file.is_some());
+        let has_available_skills = !available_skills.is_empty();
         Self {
             worktrees,
             has_rules,
@@ -59,6 +66,8 @@ impl ProjectContext {
             arch: std::env::consts::ARCH.to_string(),
             shell: ShellKind::new(&get_default_system_shell_preferring_bash(), cfg!(windows))
                 .to_string(),
+            available_skills,
+            has_available_skills,
         }
     }
 }
@@ -85,6 +94,17 @@ pub struct RulesFileContext {
     // should be moved elsewhere.
     #[serde(skip)]
     pub project_entry_id: usize,
+}
+
+/// Metadata parsed from a SKILL.md frontmatter
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct SkillMetadata {
+    /// The skill name from frontmatter
+    pub name: String,
+    /// The skill description from frontmatter
+    pub description: String,
+    /// Absolute path to the SKILL.md file
+    pub skill_path: String,
 }
 
 #[derive(Serialize)]

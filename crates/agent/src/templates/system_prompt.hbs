@@ -186,3 +186,19 @@ Rules title: {{title}}
 {{/each}}
 {{/if}}
 {{/if}}
+
+{{#if has_available_skills}}
+## Available Skills
+
+The following skills are available. To activate a skill, read its full instructions:
+
+<available_skills>
+{{#each available_skills}}
+<skill>
+<name>{{name}}</name>
+<description>{{description}}</description>
+<location>{{skill_path}}</location>
+</skill>
+{{/each}}
+</available_skills>
+{{/if}}
