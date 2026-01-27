@@ -18157,6 +18157,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "undo_tree_view"
+version = "0.1.0"
+
+[[package]]
 name = "unicase"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
