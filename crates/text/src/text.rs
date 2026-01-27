@@ -250,8 +250,6 @@ impl History {
             } else {
                 self.redo_stack.clear();
                 let entry = self.undo_stack.last_mut().unwrap();
-                self.undo_tree.push(entry.transaction_id());
-
                 entry.last_edit_at = now;
                 Some(entry)
             }
@@ -275,7 +273,15 @@ impl History {
                 }
             }
         }
-        self.group_trailing(count)
+
+        let id = self.group_trailing(count);
+        if let Some(id) = id {
+            if !self.undo_tree.contains(id) {
+                self.undo_tree.push(id);
+            }
+        }
+        println!("group {:#?}", self.undo_tree);
+        id
     }
 
     fn group_until(&mut self, transaction_id: TransactionId) {
@@ -373,6 +379,8 @@ impl History {
         assert_eq!(self.transaction_depth, 0);
         if let Some(entry) = self.undo_stack.pop() {
             self.redo_stack.push(entry);
+            self.undo_tree.move_to_parent();
+            println!("undo {:#?}", self.undo_tree);
             self.redo_stack.last()
         } else {
             None
@@ -462,6 +470,7 @@ impl History {
     fn pop_redo(&mut self) -> Option<&HistoryEntry> {
         assert_eq!(self.transaction_depth, 0);
         if let Some(entry) = self.redo_stack.pop() {
+            self.undo_tree.move_to_child(entry.transaction_id());
             self.undo_stack.push(entry);
             self.undo_stack.last()
         } else {
@@ -1485,6 +1494,7 @@ impl Buffer {
             let transaction = entry.transaction.clone();
             let transaction_id = transaction.id;
             let op = self.undo_or_redo(transaction);
+            println!("redo {:#?}", self.history.undo_tree);
             Some((transaction_id, op))
         } else {
             None

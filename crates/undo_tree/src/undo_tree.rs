@@ -94,7 +94,7 @@ impl UndoTree {
     }
 
     pub fn move_to_child(&mut self, child: TransactionId) -> Option<TransactionId> {
-        let children = self.children_of_current();
+        let children = self.current_children()?;
         if children.contains(&child) {
             if let Some(current) = self.current {
                 self.last_visited_child.insert(current, child);
@@ -119,15 +119,20 @@ impl UndoTree {
         }
     }
 
+    pub fn contains(&self, id: TransactionId) -> bool {
+        self.parents.contains_key(&id)
+    }
+
     pub fn current(&self) -> Option<TransactionId> {
         self.current
     }
 
-    pub fn children_of_current(&self) -> Vec<TransactionId> {
-        self.current
-            .and_then(|c| self.children.get(&c))
-            .cloned()
-            .unwrap_or_default()
+    pub fn current_children(&self) -> Option<Vec<TransactionId>> {
+        if let Some(current) = self.current {
+            self.children.get(&current).cloned()
+        } else {
+            None
+        }
     }
 
     pub fn children_of(&self, parent: TransactionId) -> Vec<TransactionId> {
