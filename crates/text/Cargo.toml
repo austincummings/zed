@@ -27,6 +27,7 @@ regex.workspace = true
 rope.workspace = true
 smallvec.workspace = true
 sum_tree.workspace = true
+undo_tree.workspace = true
 util.workspace = true
 
 [dev-dependencies]

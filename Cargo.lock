@@ -16870,6 +16870,7 @@ dependencies = [
  "rope",
  "smallvec",
  "sum_tree",
+ "undo_tree",
  "util",
  "zlog",
 ]

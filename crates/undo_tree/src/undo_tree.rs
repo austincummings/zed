@@ -1,14 +1,74 @@
+use std::fmt;
+
 use clock::Lamport;
 use collections::HashMap;
 
 pub type TransactionId = Lamport;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct UndoTree {
     parents: HashMap<TransactionId, Option<TransactionId>>,
     children: HashMap<TransactionId, Vec<TransactionId>>,
     current: Option<TransactionId>,
     last_visited_child: HashMap<TransactionId, TransactionId>,
+}
+
+impl fmt::Debug for UndoTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return write!(f, "UndoTree (empty)");
+        }
+
+        writeln!(f, "UndoTree")?;
+
+        // Find root nodes (transactions whose parent is None)
+        let roots: Vec<_> = self
+            .parents
+            .iter()
+            .filter(|(_, parent)| parent.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+
+        for (index, root) in roots.iter().enumerate() {
+            let is_last_root = index == roots.len() - 1;
+            self.fmt_node(f, *root, "", is_last_root)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl UndoTree {
+    fn fmt_node(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        node: TransactionId,
+        prefix: &str,
+        is_last: bool,
+    ) -> fmt::Result {
+        let connector = if is_last { "└── " } else { "├── " };
+        let marker = if self.current == Some(node) {
+            "●"
+        } else {
+            "○"
+        };
+
+        writeln!(f, "{prefix}{connector}{marker} #{}", node.value)?;
+
+        let children = self.children_of(node);
+        let child_prefix = if is_last {
+            format!("{prefix}    ")
+        } else {
+            format!("{prefix}│   ")
+        };
+
+        for (index, child) in children.iter().enumerate() {
+            let is_last_child = index == children.len() - 1;
+            self.fmt_node(f, *child, &child_prefix, is_last_child)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl UndoTree {

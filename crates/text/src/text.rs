@@ -39,6 +39,7 @@ pub use subscription::*;
 pub use sum_tree::Bias;
 use sum_tree::{Dimensions, FilterCursor, SumTree, TreeMap, TreeSet};
 use undo_map::UndoMap;
+use undo_tree::UndoTree;
 use util::debug_panic;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -150,6 +151,7 @@ struct History {
     redo_stack: Vec<HistoryEntry>,
     transaction_depth: usize,
     group_interval: Duration,
+    undo_tree: UndoTree,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +200,7 @@ impl History {
             group_interval: Duration::ZERO,
             #[cfg(not(any(test, feature = "test-support")))]
             group_interval: Duration::from_millis(300),
+            undo_tree: UndoTree::new(),
         }
     }
 
@@ -247,6 +250,8 @@ impl History {
             } else {
                 self.redo_stack.clear();
                 let entry = self.undo_stack.last_mut().unwrap();
+                self.undo_tree.push(entry.transaction_id());
+
                 entry.last_edit_at = now;
                 Some(entry)
             }
