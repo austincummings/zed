@@ -1,0 +1,23 @@
+[package]
+name = "undo_tree"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/undo_tree.rs"
+doctest = false
+
+[features]
+test-support = []
+
+[dependencies]
+clock.workspace = true
+collections.workspace = true
+
+[dev-dependencies]
+clock = { workspace = true, features = ["test-support"] }
