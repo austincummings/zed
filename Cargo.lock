@@ -18164,6 +18164,7 @@ dependencies = [
  "gpui",
  "picker",
  "ui",
+ "undo_tree",
  "workspace",
 ]
 

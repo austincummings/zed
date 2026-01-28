@@ -13,31 +13,6 @@ pub struct UndoTree {
     last_visited_child: HashMap<TransactionId, TransactionId>,
 }
 
-impl fmt::Debug for UndoTree {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_empty() {
-            return write!(f, "UndoTree (empty)");
-        }
-
-        writeln!(f, "UndoTree")?;
-
-        // Find root nodes (transactions whose parent is None)
-        let roots: Vec<_> = self
-            .parents
-            .iter()
-            .filter(|(_, parent)| parent.is_none())
-            .map(|(id, _)| *id)
-            .collect();
-
-        for (index, root) in roots.iter().enumerate() {
-            let is_last_root = index == roots.len() - 1;
-            self.fmt_node(f, *root, "", is_last_root)?;
-        }
-
-        Ok(())
-    }
-}
-
 impl UndoTree {
     pub fn new() -> Self {
         Self::default()
@@ -140,6 +115,31 @@ impl UndoTree {
         for (index, child) in children.iter().enumerate() {
             let is_last_child = index == children.len() - 1;
             self.fmt_node(f, *child, &child_prefix, is_last_child)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for UndoTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return write!(f, "UndoTree (empty)");
+        }
+
+        writeln!(f, "UndoTree")?;
+
+        // Find root nodes (transactions whose parent is None)
+        let roots: Vec<_> = self
+            .parents
+            .iter()
+            .filter(|(_, parent)| parent.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+
+        for (index, root) in roots.iter().enumerate() {
+            let is_last_root = index == roots.len() - 1;
+            self.fmt_node(f, *root, "", is_last_root)?;
         }
 
         Ok(())
