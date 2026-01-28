@@ -686,6 +686,7 @@ fn main() {
         json_schema_store::init(cx);
         miniprofiler_ui::init(*STARTUP_TIME.get().unwrap(), cx);
         which_key::init(cx);
+        undo_tree_view::init(cx);
 
         cx.observe_global::<SettingsStore>({
             let http = app_state.client.http_client();

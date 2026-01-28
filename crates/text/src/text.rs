@@ -61,6 +61,12 @@ pub struct Buffer {
     wait_for_version_txs: Vec<(clock::Global, oneshot::Sender<()>)>,
 }
 
+impl Buffer {
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Ord, Eq)]
 pub struct BufferId(NonZeroU64);
@@ -144,7 +150,7 @@ impl HistoryEntry {
     }
 }
 
-struct History {
+pub struct History {
     base_text: Rope,
     operations: TreeMap<clock::Lamport, Operation>,
     undo_stack: Vec<HistoryEntry>,
@@ -202,6 +208,10 @@ impl History {
             group_interval: Duration::from_millis(300),
             undo_tree: UndoTree::new(),
         }
+    }
+
+    pub fn undo_tree(&self) -> &UndoTree {
+        &self.undo_tree
     }
 
     fn push(&mut self, op: Operation) {

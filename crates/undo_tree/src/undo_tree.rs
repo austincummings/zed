@@ -39,39 +39,6 @@ impl fmt::Debug for UndoTree {
 }
 
 impl UndoTree {
-    fn fmt_node(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-        node: TransactionId,
-        prefix: &str,
-        is_last: bool,
-    ) -> fmt::Result {
-        let connector = if is_last { "└── " } else { "├── " };
-        let marker = if self.current == Some(node) {
-            "●"
-        } else {
-            "○"
-        };
-
-        writeln!(f, "{prefix}{connector}{marker} #{}", node.value)?;
-
-        let children = self.children_of(node);
-        let child_prefix = if is_last {
-            format!("{prefix}    ")
-        } else {
-            format!("{prefix}│   ")
-        };
-
-        for (index, child) in children.iter().enumerate() {
-            let is_last_child = index == children.len() - 1;
-            self.fmt_node(f, *child, &child_prefix, is_last_child)?;
-        }
-
-        Ok(())
-    }
-}
-
-impl UndoTree {
     pub fn new() -> Self {
         Self::default()
     }
@@ -145,6 +112,37 @@ impl UndoTree {
 
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
+    }
+
+    fn fmt_node(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        node: TransactionId,
+        prefix: &str,
+        is_last: bool,
+    ) -> fmt::Result {
+        let connector = if is_last { "└── " } else { "├── " };
+        let marker = if self.current == Some(node) {
+            "●"
+        } else {
+            "○"
+        };
+
+        writeln!(f, "{prefix}{connector}{marker} #{}", node.value)?;
+
+        let children = self.children_of(node);
+        let child_prefix = if is_last {
+            format!("{prefix}    ")
+        } else {
+            format!("{prefix}│   ")
+        };
+
+        for (index, child) in children.iter().enumerate() {
+            let is_last_child = index == children.len() - 1;
+            self.fmt_node(f, *child, &child_prefix, is_last_child)?;
+        }
+
+        Ok(())
     }
 }
 

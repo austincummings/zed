@@ -207,6 +207,7 @@ title_bar.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
 toolchain_selector.workspace = true
+undo_tree_view.workspace = true
 ui.workspace = true
 ui_prompt.workspace = true
 url.workspace = true

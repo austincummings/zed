@@ -18159,6 +18159,13 @@ dependencies = [
 [[package]]
 name = "undo_tree_view"
 version = "0.1.0"
+dependencies = [
+ "editor",
+ "gpui",
+ "picker",
+ "ui",
+ "workspace",
+]
 
 [[package]]
 name = "unicase"
@@ -21113,6 +21120,7 @@ dependencies = [
  "tree-sitter-rust",
  "ui",
  "ui_prompt",
+ "undo_tree_view",
  "url",
  "urlencoding",
  "util",
