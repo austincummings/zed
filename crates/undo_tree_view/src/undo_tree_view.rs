@@ -4,7 +4,7 @@ use gpui::{
     actions,
 };
 use picker::{Picker, PickerDelegate};
-use ui::{IntoElement, ListItem, ParentElement, Render, v_flex, vh};
+use ui::{IntoElement, ListItem, ParentElement, Render, Styled as _, rems, v_flex, vh};
 use undo_tree::UndoTree;
 use workspace::{DismissDecision, ModalView, Workspace};
 
@@ -15,16 +15,17 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn toggle(editor: Entity<Editor>, _: &Toggle, window: &mut Window, cx: &mut App) {
-    let editor = editor.read(cx);
-    let multi_buffer = editor.buffer().read(cx);
+    let undo_tree = {
+        let editor = editor.read(cx);
+        let multi_buffer = editor.buffer().read(cx);
+        // TODO: Handle multibuffers
+        let Some(buffer_handle) = multi_buffer.as_singleton() else {
+            return;
+        };
 
-    // TODO: Handle multibuffers
-    let Some(buffer_handle) = multi_buffer.as_singleton() else {
-        return;
+        let buffer = buffer_handle.read(cx);
+        buffer.history().undo_tree().clone()
     };
-
-    let buffer = buffer_handle.read(cx);
-    let undo_tree = buffer.history().undo_tree();
 
     println!("{:?}", undo_tree);
 
@@ -64,7 +65,7 @@ impl ModalView for UndoTreeView {
 
 impl Render for UndoTreeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().child("Hello world")
+        v_flex().w(rems(34.)).child(self.picker.clone())
     }
 }
 
@@ -84,11 +85,11 @@ impl UndoTreeView {
     }
 
     fn new(
-        undo_tree: &UndoTree,
-        editor: &mut Editor,
+        undo_tree: UndoTree,
+        editor: Entity<Editor>,
         window: &mut Window,
-        cx: &mut Context<Editor>,
-    ) {
+        cx: &mut Context<Self>,
+    ) -> Self {
         let delegate = UndoTreeViewDelegate::new();
         let picker = cx.new(|cx| {
             Picker::uniform_list(delegate, window, cx)
@@ -124,7 +125,7 @@ impl PickerDelegate for UndoTreeViewDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        todo!()
+        // todo!()
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> std::sync::Arc<str> {
@@ -137,15 +138,16 @@ impl PickerDelegate for UndoTreeViewDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> gpui::Task<()> {
-        todo!()
+        // todo!()
+        cx.spawn(async move |_, _| {})
     }
 
     fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        todo!()
+        // todo!()
     }
 
     fn dismissed(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        todo!()
+        // todo!()
     }
 
     fn render_match(
@@ -155,6 +157,7 @@ impl PickerDelegate for UndoTreeViewDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        todo!()
+        // todo!()
+        None
     }
 }
