@@ -15,7 +15,9 @@ doctest = false
 [dependencies]
 editor.workspace = true
 gpui.workspace = true
+language.workspace = true
 picker.workspace = true
+text.workspace = true
 ui.workspace = true
 undo_tree.workspace = true
 workspace.workspace = true

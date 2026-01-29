@@ -18162,7 +18162,9 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "gpui",
+ "language",
  "picker",
+ "text",
  "ui",
  "undo_tree",
  "workspace",

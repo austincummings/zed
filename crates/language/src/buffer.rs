@@ -3206,6 +3206,27 @@ impl Buffer {
         redone
     }
 
+    /// Navigate to a specific transaction in the undo tree.
+    /// This can navigate across branches, not just along the linear undo/redo stack.
+    pub fn goto_undo_tree_transaction(
+        &mut self,
+        target: TransactionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let was_dirty = self.is_dirty();
+        let old_version = self.version.clone();
+
+        let operations = self.text.goto_undo_tree_transaction(target);
+        let navigated = !operations.is_empty();
+        for operation in operations {
+            self.send_operation(Operation::Buffer(operation), true, cx);
+        }
+        if navigated {
+            self.did_edit(&old_version, was_dirty, cx)
+        }
+        navigated
+    }
+
     /// Override current completion triggers with the user-provided completion triggers.
     pub fn set_completion_triggers(
         &mut self,
