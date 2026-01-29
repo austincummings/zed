@@ -978,6 +978,7 @@ impl CodegenAlternative {
             if let Some(first_transaction) = self.transformation_transaction_id {
                 // Group all agent edits into the first transaction.
                 self.buffer.update(cx, |buffer, cx| {
+                    buffer.mark_transaction_source(transaction, TransactionSource::Agent);
                     buffer.merge_transactions(transaction, first_transaction, cx)
                 });
             } else {

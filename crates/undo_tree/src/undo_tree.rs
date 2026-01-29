@@ -5,6 +5,12 @@ use collections::HashMap;
 
 pub type TransactionId = Lamport;
 
+#[derive(Clone)]
+pub enum TransactionSource {
+    User,
+    Agent,
+}
+
 #[derive(Clone, Default)]
 pub struct UndoTree {
     parents: HashMap<TransactionId, Option<TransactionId>>,
@@ -12,6 +18,7 @@ pub struct UndoTree {
     current: Option<TransactionId>,
     last_visited_child: HashMap<TransactionId, TransactionId>,
     timestamps: HashMap<TransactionId, Instant>,
+    sources: HashMap<TransactionId, TransactionSource>,
 }
 
 impl UndoTree {
@@ -26,6 +33,11 @@ impl UndoTree {
             self.children.entry(current).or_default().push(id);
         }
         self.current = Some(id);
+    }
+
+    pub fn push_with_source(&mut self, id: TransactionId, source: TransactionSource) {
+        self.push(id);
+        self.sources.insert(id, source);
     }
 
     pub fn move_to_parent(&mut self) -> Option<TransactionId> {

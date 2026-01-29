@@ -7,6 +7,7 @@ use std::{
 };
 use sum_tree::Bias;
 use text::BufferId;
+use undo_tree::TransactionSource;
 
 use crate::{BufferState, MultiBufferDimension};
 
@@ -117,6 +118,13 @@ impl History {
         if let Some(transaction) = self.undo_stack.last_mut() {
             transaction.suppress_grouping = true;
         }
+    }
+
+    fn mark_transaction_source(
+        &mut self,
+        transaction_id: TransactionId,
+        source: TransactionSource,
+    ) {
     }
 
     fn forget(&mut self, transaction_id: TransactionId) -> Option<Transaction> {
@@ -422,6 +430,19 @@ impl MultiBuffer {
                 buffer.finalize_last_transaction();
             });
         }
+    }
+
+    pub fn mark_transaction_source(
+        &mut self,
+        transaction_id: TransactionId,
+        source: TransactionSource,
+    ) {
+        self.history.mark_transaction_source(transaction_id, source);
+        // for BufferState { buffer, .. } in self.buffers.values() {
+        //     buffer.update(cx, |buffer, _| {
+        //         buffer.mark_transaction_source(transaction_id, source);
+        //     });
+        // }
     }
 
     pub fn push_transaction<'a, T>(&mut self, buffer_transactions: T, cx: &Context<Self>)

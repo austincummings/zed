@@ -106,6 +106,7 @@ time.workspace = true
 time_format.workspace = true
 ui.workspace = true
 ui_input.workspace = true
+undo_tree.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true
