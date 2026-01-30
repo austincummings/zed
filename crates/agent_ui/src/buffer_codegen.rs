@@ -1,6 +1,7 @@
 use crate::{context::LoadedContext, inline_prompt_editor::CodegenStatus};
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
+use undo_tree::TransactionSource;
 use uuid::Uuid;
 
 use cloud_llm_client::CompletionIntent;
@@ -978,7 +979,7 @@ impl CodegenAlternative {
             if let Some(first_transaction) = self.transformation_transaction_id {
                 // Group all agent edits into the first transaction.
                 self.buffer.update(cx, |buffer, cx| {
-                    buffer.mark_transaction_source(transaction, TransactionSource::Agent);
+                    buffer.mark_transaction_source(transaction, TransactionSource::Agent, cx);
                     buffer.merge_transactions(transaction, first_transaction, cx)
                 });
             } else {

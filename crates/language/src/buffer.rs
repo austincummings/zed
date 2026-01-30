@@ -67,6 +67,7 @@ pub use text::{
     ToPointUtf16, Transaction, TransactionId, Unclipped,
 };
 use theme::{ActiveTheme as _, SyntaxTheme};
+use undo_tree::TransactionSource;
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;
 use util::{RangeExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
@@ -140,6 +141,16 @@ pub struct Buffer {
     encoding: &'static Encoding,
     has_bom: bool,
     reload_with_encoding_txns: HashMap<TransactionId, (&'static Encoding, bool)>,
+}
+
+impl Buffer {
+    pub fn mark_transaction_source(
+        &mut self,
+        transaction_id: TransactionId,
+        source: TransactionSource,
+    ) {
+        self.text.mark_transaction_source(transaction_id, source);
+    }
 }
 
 #[derive(Debug)]

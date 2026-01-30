@@ -9026,6 +9026,7 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "undo_tree",
  "unicase",
  "unindent",
  "util",

@@ -39,7 +39,7 @@ pub use subscription::*;
 pub use sum_tree::Bias;
 use sum_tree::{Dimensions, FilterCursor, SumTree, TreeMap, TreeSet};
 use undo_map::UndoMap;
-use undo_tree::UndoTree;
+use undo_tree::{TransactionSource, UndoTree};
 use util::debug_panic;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -64,6 +64,14 @@ pub struct Buffer {
 impl Buffer {
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    pub fn mark_transaction_source(
+        &mut self,
+        transaction_id: TransactionId,
+        source: TransactionSource,
+    ) {
+        self.history.mark_transaction_source(transaction_id, source);
     }
 }
 
@@ -374,6 +382,15 @@ impl History {
             suppress_grouping: false,
         });
         id
+    }
+
+    pub fn mark_transaction_source(
+        &mut self,
+        transaction_id: TransactionId,
+        source: TransactionSource,
+    ) {
+        self.undo_tree
+            .mark_transaction_source(transaction_id, source);
     }
 
     fn push_undo(&mut self, op_id: clock::Lamport) {

@@ -69,6 +69,7 @@ tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter.workspace = true
 unicase = "2.6"
+undo_tree.workspace = true
 util.workspace = true
 watch.workspace = true
 zlog.workspace = true

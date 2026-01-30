@@ -436,13 +436,14 @@ impl MultiBuffer {
         &mut self,
         transaction_id: TransactionId,
         source: TransactionSource,
+        cx: &mut Context<Self>,
     ) {
-        self.history.mark_transaction_source(transaction_id, source);
-        // for BufferState { buffer, .. } in self.buffers.values() {
-        //     buffer.update(cx, |buffer, _| {
-        //         buffer.mark_transaction_source(transaction_id, source);
-        //     });
-        // }
+        if let Some(buffer) = self.as_singleton() {
+            buffer.update(cx, |buffer, _| {
+                println!("Marking transaction source as {:?}", source);
+                buffer.mark_transaction_source(transaction_id, source);
+            });
+        }
     }
 
     pub fn push_transaction<'a, T>(&mut self, buffer_transactions: T, cx: &Context<Self>)

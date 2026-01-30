@@ -5,7 +5,7 @@ use collections::HashMap;
 
 pub type TransactionId = Lamport;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum TransactionSource {
     User,
     Agent,
@@ -205,6 +205,14 @@ impl UndoTree {
 
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
+    }
+
+    pub fn mark_transaction_source(
+        &mut self,
+        transaction_id: TransactionId,
+        source: TransactionSource,
+    ) {
+        self.sources.insert(transaction_id, source);
     }
 
     fn fmt_node(
