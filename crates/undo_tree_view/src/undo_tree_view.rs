@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use editor::Editor;
 use gpui::{
-    App, AppContext, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Task,
-    WeakEntity, Window, actions,
+    App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, Task, WeakEntity, Window, actions,
 };
 use language::Buffer;
 use picker::{Picker, PickerDelegate};
@@ -66,8 +66,18 @@ impl ModalView for UndoTreeView {
 }
 
 impl Render for UndoTreeView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(rems(34.))
+            .on_action(cx.listener(
+                |_this: &mut UndoTreeView,
+                 _: &Toggle,
+                 _window: &mut Window,
+                 cx: &mut Context<UndoTreeView>| {
+                    cx.emit(DismissEvent);
+                },
+            ))
+            .child(self.picker.clone())
     }
 }
 
