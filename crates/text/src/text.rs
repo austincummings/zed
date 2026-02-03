@@ -389,8 +389,7 @@ impl History {
         transaction_id: TransactionId,
         source: TransactionSource,
     ) {
-        self.undo_tree
-            .mark_transaction_source(transaction_id, source);
+        self.undo_tree.set_source(transaction_id, source);
     }
 
     fn push_undo(&mut self, op_id: clock::Lamport) {
@@ -405,7 +404,7 @@ impl History {
         assert_eq!(self.transaction_depth, 0);
         if let Some(entry) = self.undo_stack.pop() {
             self.redo_stack.push(entry);
-            self.undo_tree.move_to_parent();
+            self.undo_tree.undo();
             self.redo_stack.last()
         } else {
             None
@@ -495,7 +494,7 @@ impl History {
     fn pop_redo(&mut self) -> Option<&HistoryEntry> {
         assert_eq!(self.transaction_depth, 0);
         if let Some(entry) = self.redo_stack.pop() {
-            self.undo_tree.move_to_child(entry.transaction_id());
+            self.undo_tree.redo(entry.transaction_id());
             self.undo_stack.push(entry);
             self.undo_stack.last()
         } else {
@@ -1541,7 +1540,7 @@ impl Buffer {
 
     /// Get the path from initial state to current position in the undo tree.
     pub fn undo_tree_path(&self) -> Vec<TransactionId> {
-        self.history.undo_tree.path_to_current()
+        self.history.undo_tree.cursor().path_from_root()
     }
 
     /// Get all branch points in the undo tree.
@@ -1551,7 +1550,11 @@ impl Buffer {
 
     /// Get children of a specific transaction in the undo tree.
     pub fn undo_tree_children(&self, id: TransactionId) -> Vec<TransactionId> {
-        self.history.undo_tree.children_of(id)
+        self.history
+            .undo_tree
+            .cursor_at(Some(id))
+            .children()
+            .to_vec()
     }
 
     /// Get the current position in the undo tree.
@@ -1561,23 +1564,23 @@ impl Buffer {
 
     /// Check if currently at a branch point.
     pub fn is_at_undo_branch_point(&self) -> bool {
-        self.history.undo_tree.is_at_branch_point()
+        self.history.undo_tree.cursor().is_branch_point()
     }
 
     /// Get the default redo target at current branch point (most recently visited).
     pub fn default_redo_target(&self) -> Option<TransactionId> {
-        self.history.undo_tree.last_visited_child_of_current()
+        self.history.undo_tree.cursor().last_visited_child()
     }
 
     /// Navigate to a specific transaction in the undo tree.
     /// Returns the operations performed to reach that state.
     pub fn goto_undo_tree_transaction(&mut self, target: TransactionId) -> Vec<Operation> {
-        let current = self.history.undo_tree.current();
-        if current == Some(target) {
+        let cursor = self.history.undo_tree.cursor();
+        if cursor.id() == Some(target) {
             return Vec::new();
         }
 
-        let (to_undo, to_redo) = self.history.undo_tree.compute_path(current, Some(target));
+        let (to_undo, to_redo) = cursor.path_to(Some(target));
         let mut ops = Vec::new();
 
         // Undo transactions to reach common ancestor

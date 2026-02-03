@@ -7,12 +7,12 @@ use gpui::{
 };
 use language::Buffer;
 use picker::{Picker, PickerDelegate};
-use text::TransactionId;
 use ui::{
     Color, Icon, IconName, IntoElement, Label, LabelCommon, ListItem, ListItemSpacing,
     ParentElement, Render, Styled as _, Toggleable, rems, v_flex, vh,
 };
-use undo_tree::UndoTree;
+use undo_tree::{TransactionId, UndoTree};
+
 use workspace::{DismissDecision, ModalView, Workspace};
 
 actions!(undo_tree_view, [Toggle]);
@@ -153,7 +153,7 @@ impl UndoTreeViewDelegate {
         let current = undo_tree.current();
 
         // Find all root nodes (nodes with no parent)
-        let path_to_current = undo_tree.path_to_current();
+        let path_to_current = undo_tree.cursor().path_from_root();
 
         // If tree is empty, return empty entries
         if path_to_current.is_empty() {
@@ -176,9 +176,10 @@ impl UndoTreeViewDelegate {
         child_index: usize,
         sibling_count: usize,
     ) {
-        let children = undo_tree.children_of(node);
+        let cursor = undo_tree.cursor_at(Some(node));
+        let children = cursor.children();
         let is_branch_point = children.len() > 1;
-        let timestamp = undo_tree.timestamp_of(node);
+        let timestamp = cursor.timestamp();
 
         entries.push(TreeEntry {
             id: node,
@@ -191,7 +192,7 @@ impl UndoTreeViewDelegate {
         });
 
         let child_count = children.len();
-        for (index, child) in children.into_iter().enumerate() {
+        for (index, child) in children.iter().copied().enumerate() {
             Self::build_entries_recursive(
                 undo_tree,
                 child,

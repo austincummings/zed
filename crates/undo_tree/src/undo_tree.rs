@@ -3,25 +3,51 @@ use std::{fmt, time::Instant};
 use clock::Lamport;
 use collections::HashMap;
 
-#[derive(Clone, Debug)]
+/// A unique identifier for a transaction in the undo tree.
+pub type TransactionId = Lamport;
+
+/// Indicates whether a transaction was created by the user or by an AI agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransactionSource {
     User,
     Agent,
 }
 
+/// Information about a node in the undo tree.
+///
+/// This struct provides access to all node data in a single lookup,
+/// which is more efficient than calling individual accessor methods.
+#[derive(Clone, Debug)]
+pub struct NodeInfo<'a> {
+    pub parent: Option<TransactionId>,
+    pub children: &'a [TransactionId],
+    pub last_visited_child: Option<TransactionId>,
+    pub timestamp: Instant,
+    pub source: Option<&'a TransactionSource>,
+}
+
+impl NodeInfo<'_> {
+    /// Check if this node is a branch point (has multiple children).
+    pub fn is_branch_point(&self) -> bool {
+        self.children.len() > 1
+    }
+}
+
 #[derive(Clone)]
 struct UndoNode {
-    parent: Option<Lamport>,
-    children: Vec<Lamport>,
-    last_visited_child: Option<Lamport>,
+    parent: Option<TransactionId>,
+    children: Vec<TransactionId>,
+    last_visited_child: Option<TransactionId>,
     timestamp: Instant,
     source: Option<TransactionSource>,
 }
 
+/// A tree structure that tracks the history of undo/redo operations,
+/// preserving branches when edits are made after undoing.
 #[derive(Clone, Default)]
 pub struct UndoTree {
-    nodes: HashMap<Lamport, UndoNode>,
-    current: Option<Lamport>,
+    nodes: HashMap<TransactionId, UndoNode>,
+    current: Option<TransactionId>,
 }
 
 impl UndoTree {
@@ -29,7 +55,9 @@ impl UndoTree {
         Self::default()
     }
 
-    pub fn push(&mut self, id: Lamport) {
+    /// Add a new transaction as a child of the current position.
+    /// The new transaction becomes the current position.
+    pub fn push(&mut self, id: TransactionId) {
         if let Some(current) = self.current {
             if let Some(current_node) = self.nodes.get_mut(&current) {
                 current_node.children.push(id);
@@ -48,14 +76,17 @@ impl UndoTree {
         self.current = Some(id);
     }
 
-    pub fn push_with_source(&mut self, id: Lamport, source: TransactionSource) {
-        self.push(id);
+    /// Set the source (User or Agent) for a transaction.
+    pub fn set_source(&mut self, id: TransactionId, source: TransactionSource) {
         if let Some(node) = self.nodes.get_mut(&id) {
             node.source = Some(source);
         }
     }
 
-    pub fn move_to_parent(&mut self) -> Option<Lamport> {
+    /// Move current position to parent (used during undo).
+    /// Updates last_visited_child on the parent to track the path taken.
+    /// Returns the new current position.
+    pub fn undo(&mut self) -> Option<TransactionId> {
         let current = self.current?;
         let parent = self.nodes.get(&current)?.parent;
         if let Some(parent_id) = parent {
@@ -67,7 +98,10 @@ impl UndoTree {
         self.current
     }
 
-    pub fn move_to_child(&mut self, child: Lamport) -> Option<Lamport> {
+    /// Move current position to a specific child (used during redo).
+    /// Updates last_visited_child on current to track the path taken.
+    /// Returns the child id if successful, None if child is not valid.
+    pub fn redo(&mut self, child: TransactionId) -> Option<TransactionId> {
         let current = self.current?;
         let current_node = self.nodes.get(&current)?;
         if !current_node.children.contains(&child) {
@@ -80,105 +114,9 @@ impl UndoTree {
         Some(child)
     }
 
-    pub fn contains(&self, id: Lamport) -> bool {
-        self.nodes.contains_key(&id)
-    }
-
-    pub fn current(&self) -> Option<Lamport> {
-        self.current
-    }
-
-    pub fn timestamp_of(&self, id: Lamport) -> Option<Instant> {
-        self.nodes.get(&id).map(|node| node.timestamp)
-    }
-
-    pub fn children_of(&self, parent: Lamport) -> Vec<Lamport> {
-        self.nodes
-            .get(&parent)
-            .map(|node| node.children.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn parent_of(&self, id: Lamport) -> Option<Lamport> {
-        self.nodes.get(&id)?.parent
-    }
-
-    pub fn last_visited_child_of_current(&self) -> Option<Lamport> {
-        let current = self.current?;
-        self.nodes.get(&current)?.last_visited_child
-    }
-
-    pub fn last_visited_child_of(&self, id: Lamport) -> Option<Lamport> {
-        self.nodes.get(&id)?.last_visited_child
-    }
-
-    pub fn is_at_branch_point(&self) -> bool {
-        self.current
-            .and_then(|id| self.nodes.get(&id))
-            .map(|node| node.children.len() > 1)
-            .unwrap_or(false)
-    }
-
-    pub fn is_branch_point(&self, id: Lamport) -> bool {
-        self.nodes
-            .get(&id)
-            .map(|node| node.children.len() > 1)
-            .unwrap_or(false)
-    }
-
-    pub fn branch_points(&self) -> Vec<Lamport> {
-        self.nodes
-            .iter()
-            .filter(|(_, node)| node.children.len() > 1)
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    pub fn path_to_current(&self) -> Vec<Lamport> {
-        self.path_to_node(self.current)
-    }
-
-    pub fn path_to_node(&self, target: Option<Lamport>) -> Vec<Lamport> {
-        let mut path = Vec::new();
-        let mut node = target;
-        while let Some(id) = node {
-            path.push(id);
-            node = self.nodes.get(&id).and_then(|n| n.parent);
-        }
-        path.reverse();
-        path
-    }
-
-    /// Compute navigation path between two nodes.
-    ///
-    /// Returns `(nodes_to_undo, nodes_to_redo)` - the transactions that need to be
-    /// undone and then redone to navigate from `from` to `to`.
-    pub fn compute_path(
-        &self,
-        from: Option<Lamport>,
-        to: Option<Lamport>,
-    ) -> (Vec<Lamport>, Vec<Lamport>) {
-        let path_to_from = self.path_to_node(from);
-        let path_to_to = self.path_to_node(to);
-
-        let mut common_len = 0;
-        for (a, b) in path_to_from.iter().zip(path_to_to.iter()) {
-            if a == b {
-                common_len += 1;
-            } else {
-                break;
-            }
-        }
-
-        let to_undo: Vec<_> = path_to_from[common_len..].iter().rev().copied().collect();
-        let to_redo: Vec<_> = path_to_to[common_len..].to_vec();
-
-        (to_undo, to_redo)
-    }
-
     /// Navigate to a specific transaction, updating current and last_visited_child
-    /// along the path.
-    pub fn navigate_to(&mut self, target: Option<Lamport>) {
+    /// along the path. Used for branch switching.
+    pub fn navigate_to(&mut self, target: Option<TransactionId>) {
         if let Some(target_id) = target {
             let path = self.path_to_node(Some(target_id));
             for window in path.windows(2) {
@@ -190,28 +128,81 @@ impl UndoTree {
         self.current = target;
     }
 
+    /// Check if a transaction exists in the tree.
+    pub fn contains(&self, id: TransactionId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
+    /// Get the current position in the tree.
+    pub fn current(&self) -> Option<TransactionId> {
+        self.current
+    }
+
+    /// Get the number of transactions in the tree.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
+    /// Check if the tree is empty.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
-    pub fn mark_transaction_source(
-        &mut self,
-        transaction_id: Lamport,
-        source: TransactionSource,
-    ) {
-        if let Some(node) = self.nodes.get_mut(&transaction_id) {
-            node.source = Some(source);
+    /// Check if a specific transaction is a branch point (has multiple children).
+    pub fn is_branch_point(&self, id: TransactionId) -> bool {
+        self.nodes
+            .get(&id)
+            .map(|node| node.children.len() > 1)
+            .unwrap_or(false)
+    }
+
+    /// Get all branch points in the tree.
+    pub fn branch_points(&self) -> Vec<TransactionId> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.children.len() > 1)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Create a cursor at the current position.
+    pub fn cursor(&self) -> Cursor<'_> {
+        Cursor {
+            tree: self,
+            position: self.current,
         }
+    }
+
+    /// Create a cursor at a specific position.
+    pub fn cursor_at(&self, position: Option<TransactionId>) -> Cursor<'_> {
+        Cursor {
+            tree: self,
+            position,
+        }
+    }
+
+    fn path_to_node(&self, target: Option<TransactionId>) -> Vec<TransactionId> {
+        let mut path = Vec::new();
+        let mut node = target;
+        while let Some(id) = node {
+            path.push(id);
+            node = self.nodes.get(&id).and_then(|n| n.parent);
+        }
+        path.reverse();
+        path
+    }
+
+    fn children_slice(&self, id: TransactionId) -> &[TransactionId] {
+        self.nodes
+            .get(&id)
+            .map(|node| node.children.as_slice())
+            .unwrap_or(&[])
     }
 
     fn fmt_node(
         &self,
         f: &mut fmt::Formatter<'_>,
-        id: Lamport,
+        id: TransactionId,
         prefix: &str,
         is_last: bool,
     ) -> fmt::Result {
@@ -224,7 +215,7 @@ impl UndoTree {
 
         writeln!(f, "{prefix}{connector}{marker} #{}", id.value)?;
 
-        let children = self.children_of(id);
+        let children = self.children_slice(id);
         let child_prefix = if is_last {
             format!("{prefix}    ")
         } else {
@@ -264,14 +255,174 @@ impl fmt::Debug for UndoTree {
     }
 }
 
+/// A cursor for exploring an UndoTree without modifying its current position.
+///
+/// Cursors provide read-only access to the tree structure and can be moved
+/// around independently of the tree's actual current position.
+#[derive(Clone)]
+pub struct Cursor<'a> {
+    tree: &'a UndoTree,
+    position: Option<TransactionId>,
+}
+
+impl<'a> Cursor<'a> {
+    /// Get the transaction id at the cursor's current position.
+    pub fn id(&self) -> Option<TransactionId> {
+        self.position
+    }
+
+    /// Get all information about the node at the cursor's current position.
+    ///
+    /// This is more efficient than calling individual accessor methods when
+    /// multiple properties are needed, as it performs a single lookup.
+    pub fn node(&self) -> Option<NodeInfo<'a>> {
+        let id = self.position?;
+        let node = self.tree.nodes.get(&id)?;
+        Some(NodeInfo {
+            parent: node.parent,
+            children: &node.children,
+            last_visited_child: node.last_visited_child,
+            timestamp: node.timestamp,
+            source: node.source.as_ref(),
+        })
+    }
+
+    /// Get the parent of the cursor's current position.
+    pub fn parent(&self) -> Option<TransactionId> {
+        self.position
+            .and_then(|id| self.tree.nodes.get(&id))
+            .and_then(|node| node.parent)
+    }
+
+    /// Get the children of the cursor's current position.
+    pub fn children(&self) -> &'a [TransactionId] {
+        self.position
+            .map(|id| self.tree.children_slice(id))
+            .unwrap_or(&[])
+    }
+
+    /// Get the timestamp of the cursor's current position.
+    pub fn timestamp(&self) -> Option<Instant> {
+        self.position
+            .and_then(|id| self.tree.nodes.get(&id))
+            .map(|node| node.timestamp)
+    }
+
+    /// Get the source (User or Agent) of the cursor's current position.
+    pub fn source(&self) -> Option<&'a TransactionSource> {
+        self.position
+            .and_then(|id| self.tree.nodes.get(&id))
+            .and_then(|node| node.source.as_ref())
+    }
+
+    /// Get the last visited child of the cursor's current position.
+    pub fn last_visited_child(&self) -> Option<TransactionId> {
+        self.position
+            .and_then(|id| self.tree.nodes.get(&id))
+            .and_then(|node| node.last_visited_child)
+    }
+
+    /// Check if the cursor's current position is a branch point.
+    pub fn is_branch_point(&self) -> bool {
+        self.position
+            .map(|id| self.tree.is_branch_point(id))
+            .unwrap_or(false)
+    }
+
+    /// Move the cursor to its parent position.
+    /// Returns true if the cursor moved, false if already at root.
+    pub fn move_up(&mut self) -> bool {
+        if let Some(parent) = self.parent() {
+            self.position = Some(parent);
+            true
+        } else if self.position.is_some() {
+            self.position = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the cursor to a specific child.
+    /// Returns true if the cursor moved, false if the child is invalid.
+    pub fn move_down(&mut self, child: TransactionId) -> bool {
+        if self.children().contains(&child) {
+            self.position = Some(child);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the cursor to an arbitrary position.
+    pub fn move_to(&mut self, target: Option<TransactionId>) {
+        self.position = target;
+    }
+
+    /// Compute the navigation path from the cursor's position to a target.
+    ///
+    /// Returns `(to_undo, to_redo)` - the transactions that need to be
+    /// undone and then redone to navigate from current position to target.
+    pub fn path_to(
+        &self,
+        target: Option<TransactionId>,
+    ) -> (Vec<TransactionId>, Vec<TransactionId>) {
+        let path_to_from = self.tree.path_to_node(self.position);
+        let path_to_to = self.tree.path_to_node(target);
+
+        let mut common_len = 0;
+        for (a, b) in path_to_from.iter().zip(path_to_to.iter()) {
+            if a == b {
+                common_len += 1;
+            } else {
+                break;
+            }
+        }
+
+        let to_undo: Vec<_> = path_to_from[common_len..].iter().rev().copied().collect();
+        let to_redo: Vec<_> = path_to_to[common_len..].to_vec();
+
+        (to_undo, to_redo)
+    }
+
+    /// Get an iterator over ancestors, from the cursor's position up to the root.
+    pub fn ancestors(&self) -> Ancestors<'a> {
+        Ancestors {
+            tree: self.tree,
+            current: self.position,
+        }
+    }
+
+    /// Get the path from the root to the cursor's current position.
+    pub fn path_from_root(&self) -> Vec<TransactionId> {
+        self.tree.path_to_node(self.position)
+    }
+}
+
+/// An iterator that yields transaction ids from a starting position up to the root.
+pub struct Ancestors<'a> {
+    tree: &'a UndoTree,
+    current: Option<TransactionId>,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = TransactionId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let id = self.current?;
+        self.current = self.tree.nodes.get(&id).and_then(|n| n.parent);
+        Some(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clock::ReplicaId;
 
     use super::*;
 
-    fn tx(value: u32) -> Lamport {
-        Lamport {
+    fn tx(value: u32) -> TransactionId {
+        TransactionId {
             value,
             replica_id: ReplicaId::new(1),
         }
@@ -283,6 +434,11 @@ mod tests {
         assert!(tree.is_empty());
         assert_eq!(tree.len(), 0);
         assert_eq!(tree.current(), None);
+
+        let cursor = tree.cursor();
+        assert_eq!(cursor.id(), None);
+        assert_eq!(cursor.parent(), None);
+        assert!(cursor.children().is_empty());
     }
 
     #[test]
@@ -306,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_move_to_child_and_parent() {
+    fn test_undo_redo() {
         let mut tree = UndoTree::new();
 
         let tx1 = tx(1);
@@ -316,10 +472,37 @@ mod tests {
         let tx3 = tx(3);
         tree.push(tx3);
 
-        assert_eq!(tree.move_to_parent(), Some(tx2));
+        assert_eq!(tree.undo(), Some(tx2));
         assert_eq!(tree.current(), Some(tx2));
 
-        assert_eq!(tree.move_to_child(tx3), Some(tx3));
+        assert_eq!(tree.redo(tx3), Some(tx3));
+        assert_eq!(tree.current(), Some(tx3));
+    }
+
+    #[test]
+    fn test_cursor_navigation() {
+        let mut tree = UndoTree::new();
+
+        let tx1 = tx(1);
+        tree.push(tx1);
+        let tx2 = tx(2);
+        tree.push(tx2);
+        let tx3 = tx(3);
+        tree.push(tx3);
+
+        let mut cursor = tree.cursor();
+        assert_eq!(cursor.id(), Some(tx3));
+
+        assert!(cursor.move_up());
+        assert_eq!(cursor.id(), Some(tx2));
+
+        assert!(cursor.move_up());
+        assert_eq!(cursor.id(), Some(tx1));
+
+        assert!(cursor.move_down(tx2));
+        assert_eq!(cursor.id(), Some(tx2));
+
+        // Tree's current is unchanged
         assert_eq!(tree.current(), Some(tx3));
     }
 
@@ -334,13 +517,15 @@ mod tests {
         let tx3 = tx(3);
         tree.push(tx3);
 
-        assert_eq!(tree.move_to_parent(), Some(tx2));
+        tree.undo();
         // Moving to parent sets last_visited_child on tx2
-        assert_eq!(tree.last_visited_child_of(tx2), Some(tx3));
+        let cursor = tree.cursor_at(Some(tx2));
+        assert_eq!(cursor.last_visited_child(), Some(tx3));
 
-        assert_eq!(tree.move_to_child(tx3), Some(tx3));
-        // Moving to child sets last_visited_child on tx2
-        assert_eq!(tree.last_visited_child_of(tx2), Some(tx3));
+        tree.redo(tx3);
+        // Moving to child keeps last_visited_child on tx2
+        let cursor = tree.cursor_at(Some(tx2));
+        assert_eq!(cursor.last_visited_child(), Some(tx3));
     }
 
     #[test]
@@ -352,21 +537,23 @@ mod tests {
         let tx2 = tx(2);
         tree.push(tx2);
 
-        assert_eq!(tree.move_to_parent(), Some(tx1));
+        tree.undo();
 
         let tx3 = tx(3);
         tree.push(tx3);
         assert_eq!(tree.current(), Some(tx3));
         assert_eq!(tree.len(), 3);
 
-        assert_eq!(tree.children_of(tx1), vec![tx2, tx3]);
+        let cursor = tree.cursor_at(Some(tx1));
+        assert_eq!(cursor.children(), &[tx2, tx3]);
     }
 
     #[test]
-    fn test_path_to_current() {
+    fn test_path_from_root() {
         let mut tree = UndoTree::new();
 
-        assert_eq!(tree.path_to_current(), vec![]);
+        let cursor = tree.cursor();
+        assert_eq!(cursor.path_from_root(), vec![]);
 
         let tx1 = tx(1);
         let tx2 = tx(2);
@@ -376,13 +563,33 @@ mod tests {
         tree.push(tx2);
         tree.push(tx3);
 
-        assert_eq!(tree.path_to_current(), vec![tx1, tx2, tx3]);
+        let cursor = tree.cursor();
+        assert_eq!(cursor.path_from_root(), vec![tx1, tx2, tx3]);
 
-        tree.move_to_parent();
-        assert_eq!(tree.path_to_current(), vec![tx1, tx2]);
+        tree.undo();
+        let cursor = tree.cursor();
+        assert_eq!(cursor.path_from_root(), vec![tx1, tx2]);
 
-        tree.move_to_parent();
-        assert_eq!(tree.path_to_current(), vec![tx1]);
+        tree.undo();
+        let cursor = tree.cursor();
+        assert_eq!(cursor.path_from_root(), vec![tx1]);
+    }
+
+    #[test]
+    fn test_ancestors() {
+        let mut tree = UndoTree::new();
+
+        let tx1 = tx(1);
+        let tx2 = tx(2);
+        let tx3 = tx(3);
+
+        tree.push(tx1);
+        tree.push(tx2);
+        tree.push(tx3);
+
+        let cursor = tree.cursor();
+        let ancestors: Vec<_> = cursor.ancestors().collect();
+        assert_eq!(ancestors, vec![tx3, tx2, tx1]);
     }
 
     #[test]
@@ -397,7 +604,7 @@ mod tests {
         tree.push(tx2);
         assert_eq!(tree.branch_points(), vec![]);
 
-        tree.move_to_parent();
+        tree.undo();
         tree.push(tx3);
 
         let branch_points = tree.branch_points();
@@ -406,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_at_branch_point() {
+    fn test_is_branch_point() {
         let mut tree = UndoTree::new();
 
         let tx1 = tx(1);
@@ -416,20 +623,20 @@ mod tests {
         tree.push(tx1);
         tree.push(tx2);
 
-        tree.move_to_parent();
-        assert!(!tree.is_at_branch_point());
+        tree.undo();
+        assert!(!tree.cursor().is_branch_point());
 
         tree.push(tx3);
-        tree.move_to_parent();
+        tree.undo();
 
-        assert!(tree.is_at_branch_point());
+        assert!(tree.cursor().is_branch_point());
         assert!(tree.is_branch_point(tx1));
         assert!(!tree.is_branch_point(tx2));
         assert!(!tree.is_branch_point(tx3));
     }
 
     #[test]
-    fn test_compute_path_same_branch() {
+    fn test_path_to_same_branch() {
         let mut tree = UndoTree::new();
 
         let tx1 = tx(1);
@@ -440,17 +647,19 @@ mod tests {
         tree.push(tx2);
         tree.push(tx3);
 
-        let (to_undo, to_redo) = tree.compute_path(Some(tx3), Some(tx1));
+        let cursor = tree.cursor_at(Some(tx3));
+        let (to_undo, to_redo) = cursor.path_to(Some(tx1));
         assert_eq!(to_undo, vec![tx3, tx2]);
         assert_eq!(to_redo, vec![]);
 
-        let (to_undo, to_redo) = tree.compute_path(Some(tx1), Some(tx3));
+        let cursor = tree.cursor_at(Some(tx1));
+        let (to_undo, to_redo) = cursor.path_to(Some(tx3));
         assert_eq!(to_undo, vec![]);
         assert_eq!(to_redo, vec![tx2, tx3]);
     }
 
     #[test]
-    fn test_compute_path_across_branches() {
+    fn test_path_to_across_branches() {
         let mut tree = UndoTree::new();
 
         let tx1 = tx(1);
@@ -459,16 +668,17 @@ mod tests {
 
         tree.push(tx1);
         tree.push(tx2);
-        tree.move_to_parent();
+        tree.undo();
         tree.push(tx3);
 
-        let (to_undo, to_redo) = tree.compute_path(Some(tx2), Some(tx3));
+        let cursor = tree.cursor_at(Some(tx2));
+        let (to_undo, to_redo) = cursor.path_to(Some(tx3));
         assert_eq!(to_undo, vec![tx2]);
         assert_eq!(to_redo, vec![tx3]);
     }
 
     #[test]
-    fn test_compute_path_to_root() {
+    fn test_path_to_root() {
         let mut tree = UndoTree::new();
 
         let tx1 = tx(1);
@@ -477,11 +687,13 @@ mod tests {
         tree.push(tx1);
         tree.push(tx2);
 
-        let (to_undo, to_redo) = tree.compute_path(Some(tx2), None);
+        let cursor = tree.cursor_at(Some(tx2));
+        let (to_undo, to_redo) = cursor.path_to(None);
         assert_eq!(to_undo, vec![tx2, tx1]);
         assert_eq!(to_redo, vec![]);
 
-        let (to_undo, to_redo) = tree.compute_path(None, Some(tx2));
+        let cursor = tree.cursor_at(None);
+        let (to_undo, to_redo) = cursor.path_to(Some(tx2));
         assert_eq!(to_undo, vec![]);
         assert_eq!(to_redo, vec![tx1, tx2]);
     }
@@ -496,22 +708,22 @@ mod tests {
 
         tree.push(tx1);
         tree.push(tx2);
-        tree.move_to_parent();
+        tree.undo();
         tree.push(tx3);
 
         assert_eq!(tree.current(), Some(tx3));
 
         tree.navigate_to(Some(tx2));
         assert_eq!(tree.current(), Some(tx2));
-        assert_eq!(tree.last_visited_child_of(tx1), Some(tx2));
+        assert_eq!(tree.cursor_at(Some(tx1)).last_visited_child(), Some(tx2));
 
         tree.navigate_to(Some(tx3));
         assert_eq!(tree.current(), Some(tx3));
-        assert_eq!(tree.last_visited_child_of(tx1), Some(tx3));
+        assert_eq!(tree.cursor_at(Some(tx1)).last_visited_child(), Some(tx3));
     }
 
     #[test]
-    fn test_parent_of() {
+    fn test_parent() {
         let mut tree = UndoTree::new();
 
         let tx1 = tx(1);
@@ -522,9 +734,9 @@ mod tests {
         tree.push(tx2);
         tree.push(tx3);
 
-        assert_eq!(tree.parent_of(tx1), None);
-        assert_eq!(tree.parent_of(tx2), Some(tx1));
-        assert_eq!(tree.parent_of(tx3), Some(tx2));
+        assert_eq!(tree.cursor_at(Some(tx1)).parent(), None);
+        assert_eq!(tree.cursor_at(Some(tx2)).parent(), Some(tx1));
+        assert_eq!(tree.cursor_at(Some(tx3)).parent(), Some(tx2));
     }
 
     #[test]
@@ -541,17 +753,67 @@ mod tests {
         tree.push(tx2);
         tree.push(tx3);
 
-        tree.move_to_parent();
-        tree.move_to_parent();
+        tree.undo();
+        tree.undo();
         tree.push(tx4);
         tree.push(tx5);
 
-        assert_eq!(tree.children_of(tx1), vec![tx2, tx4]);
-        assert_eq!(tree.children_of(tx2), vec![tx3]);
-        assert_eq!(tree.children_of(tx4), vec![tx5]);
+        assert_eq!(tree.cursor_at(Some(tx1)).children(), &[tx2, tx4]);
+        assert_eq!(tree.cursor_at(Some(tx2)).children(), &[tx3]);
+        assert_eq!(tree.cursor_at(Some(tx4)).children(), &[tx5]);
 
-        let (to_undo, to_redo) = tree.compute_path(Some(tx5), Some(tx3));
+        let cursor = tree.cursor_at(Some(tx5));
+        let (to_undo, to_redo) = cursor.path_to(Some(tx3));
         assert_eq!(to_undo, vec![tx5, tx4]);
         assert_eq!(to_redo, vec![tx2, tx3]);
+    }
+
+    #[test]
+    fn test_set_source() {
+        let mut tree = UndoTree::new();
+
+        let tx1 = tx(1);
+        tree.push(tx1);
+        tree.set_source(tx1, TransactionSource::Agent);
+
+        let cursor = tree.cursor();
+        assert_eq!(cursor.source(), Some(&TransactionSource::Agent));
+    }
+
+    #[test]
+    fn test_cursor_node() {
+        let mut tree = UndoTree::new();
+
+        let tx1 = tx(1);
+        let tx2 = tx(2);
+        let tx3 = tx(3);
+
+        tree.push(tx1);
+        tree.push(tx2);
+        tree.set_source(tx2, TransactionSource::User);
+
+        tree.undo();
+        tree.push(tx3);
+        tree.set_source(tx3, TransactionSource::Agent);
+
+        // Test node() on a branch point
+        let cursor = tree.cursor_at(Some(tx1));
+        let node = cursor.node().expect("node should exist");
+        assert_eq!(node.parent, None);
+        assert_eq!(node.children, &[tx2, tx3]);
+        assert!(node.is_branch_point());
+        assert_eq!(node.source, None);
+
+        // Test node() on a leaf with source
+        let cursor = tree.cursor_at(Some(tx3));
+        let node = cursor.node().expect("node should exist");
+        assert_eq!(node.parent, Some(tx1));
+        assert!(node.children.is_empty());
+        assert!(!node.is_branch_point());
+        assert_eq!(node.source, Some(&TransactionSource::Agent));
+
+        // Test node() at None position
+        let cursor = tree.cursor_at(None);
+        assert!(cursor.node().is_none());
     }
 }
