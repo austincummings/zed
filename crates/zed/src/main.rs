@@ -1684,13 +1684,27 @@ fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut App) {
 fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     use std::time::Duration;
     cx.spawn(async move |cx| {
-        let (mut events, _) = fs
+        let (mut events, watcher) = fs
             .watch(paths::themes_dir(), Duration::from_millis(100))
             .await;
+
+        let themes_dir = paths::themes_dir();
+        if let Some(mut dir_entries) = fs.read_dir(themes_dir).await.log_err() {
+            while let Some(entry) = dir_entries.next().await {
+                if let Some(path) = entry.log_err()
+                    && path.extension().map_or(false, |ext| ext == "json")
+                {
+                    watcher.add(&path).log_err();
+                }
+            }
+        }
 
         while let Some(paths) = events.next().await {
             for event in paths {
                 if fs.metadata(&event.path).await.ok().flatten().is_some() {
+                    if event.path.extension().map_or(false, |ext| ext == "json") {
+                        watcher.add(&event.path).log_err();
+                    }
                     let theme_registry = cx.update(|cx| ThemeRegistry::global(cx));
                     if theme_registry
                         .load_user_theme(&event.path, fs.clone())
