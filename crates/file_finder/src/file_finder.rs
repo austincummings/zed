@@ -13,16 +13,13 @@ use gpui::{
     KeyContext, Modifiers, ModifiersChangedEvent, ParentElement, Render, Styled, Task, WeakEntity,
     Window, actions, rems,
 };
-use open_path_prompt::{
-    OpenPathPrompt,
-    file_finder_settings::{FileFinderSettings, FileFinderWidth},
-};
+use open_path_prompt::{OpenPathPrompt, file_finder_settings::FileFinderSettings};
 use picker::{Picker, PickerDelegate};
 use project::{
     PathMatchCandidateSet, Project, ProjectPath, WorktreeId, worktree_store::WorktreeStore,
 };
 use project_panel::project_panel_settings::ProjectPanelSettings;
-use settings::Settings;
+use settings::{ModalWidthContent, Settings};
 use std::{
     borrow::Cow,
     cmp,
@@ -343,16 +340,16 @@ impl FileFinder {
         })
     }
 
-    pub fn modal_max_width(width_setting: FileFinderWidth, window: &mut Window) -> Pixels {
+    pub fn modal_max_width(width_setting: ModalWidthContent, window: &mut Window) -> Pixels {
         let window_width = window.viewport_size().width;
         let small_width = rems(34.).to_pixels(window.rem_size());
 
         match width_setting {
-            FileFinderWidth::Small => small_width,
-            FileFinderWidth::Full => window_width,
-            FileFinderWidth::XLarge => (window_width - px(512.)).max(small_width),
-            FileFinderWidth::Large => (window_width - px(768.)).max(small_width),
-            FileFinderWidth::Medium => (window_width - px(1024.)).max(small_width),
+            ModalWidthContent::Small => small_width,
+            ModalWidthContent::Full => window_width,
+            ModalWidthContent::XLarge => (window_width - px(512.)).max(small_width),
+            ModalWidthContent::Large => (window_width - px(768.)).max(small_width),
+            ModalWidthContent::Medium => (window_width - px(1024.)).max(small_width),
         }
     }
 }

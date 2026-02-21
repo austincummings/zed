@@ -1,3 +1,4 @@
+mod command_palette_settings;
 mod persistence;
 
 use std::{
@@ -22,11 +23,13 @@ use persistence::COMMAND_PALETTE_HISTORY;
 use picker::Direction;
 use picker::{Picker, PickerDelegate};
 use postage::{sink::Sink, stream::Stream};
-use settings::Settings;
+use settings::{ModalWidthContent, Settings};
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt;
 use workspace::{ModalView, Workspace, WorkspaceSettings};
 use zed_actions::{OpenZedUrl, command_palette::Toggle};
+
+use crate::command_palette_settings::CommandPaletteSettings;
 
 pub fn init(cx: &mut App) {
     command_palette_hooks::init(cx);
@@ -132,6 +135,19 @@ impl CommandPalette {
         self.picker
             .update(cx, |picker, cx| picker.set_query(query, window, cx))
     }
+
+    pub fn modal_max_width(width_setting: ModalWidthContent, window: &mut Window) -> Pixels {
+        let window_width = window.viewport_size().width;
+        let small_width = rems(34.).to_pixels(window.rem_size());
+
+        match width_setting {
+            ModalWidthContent::Small => small_width,
+            ModalWidthContent::Full => window_width,
+            ModalWidthContent::XLarge => (window_width - px(512.)).max(small_width),
+            ModalWidthContent::Large => (window_width - px(768.)).max(small_width),
+            ModalWidthContent::Medium => (window_width - px(1024.)).max(small_width),
+        }
+    }
 }
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
@@ -143,10 +159,14 @@ impl Focusable for CommandPalette {
 }
 
 impl Render for CommandPalette {
-    fn render(&mut self, _window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let command_palette_settings = CommandPaletteSettings::get_global(cx);
+        let modal_max_width =
+            Self::modal_max_width(command_palette_settings.modal_max_width, window);
+
         v_flex()
             .key_context("CommandPalette")
-            .w(rems(34.))
+            .w(modal_max_width)
             .child(self.picker.clone())
     }
 }

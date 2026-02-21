@@ -27,6 +27,7 @@ menu.workspace = true
 log.workspace = true
 picker.workspace = true
 postage.workspace = true
+schemars.workspace = true
 serde.workspace = true
 settings.workspace = true
 theme.workspace = true

@@ -410,7 +410,7 @@ TBD: Centered layout related settings
     "show_other_hints": true,
 
     // Whether to show a background for inlay hints (theme `hint.background`)
-    "show_background": false, //
+    "show_background": false,
 
     // Time to wait after editing before requesting hints (0 to disable debounce)
     "edit_debounce_ms": 700,
