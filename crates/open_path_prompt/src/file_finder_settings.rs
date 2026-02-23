@@ -1,10 +1,10 @@
-use serde::{Deserialize};
-use settings::{ModalWidthContent, RegisterSetting, Settings};
+use serde::Deserialize;
+use settings::{ModalWidth, RegisterSetting, Settings};
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, RegisterSetting)]
 pub struct FileFinderSettings {
     pub file_icons: bool,
-    pub modal_max_width: ModalWidthContent,
+    pub modal_max_width: ModalWidth,
     pub skip_focus_for_active_in_search: bool,
     pub include_ignored: Option<bool>,
 }

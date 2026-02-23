@@ -23,7 +23,7 @@ use persistence::COMMAND_PALETTE_HISTORY;
 use picker::Direction;
 use picker::{Picker, PickerDelegate};
 use postage::{sink::Sink, stream::Stream};
-use settings::{ModalWidthContent, Settings};
+use settings::{ModalWidth, Settings};
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt;
 use workspace::{ModalView, Workspace, WorkspaceSettings};
@@ -136,16 +136,16 @@ impl CommandPalette {
             .update(cx, |picker, cx| picker.set_query(query, window, cx))
     }
 
-    pub fn modal_max_width(width_setting: ModalWidthContent, window: &mut Window) -> Pixels {
+    pub fn modal_max_width(width_setting: ModalWidth, window: &mut Window) -> Pixels {
         let window_width = window.viewport_size().width;
         let small_width = rems(34.).to_pixels(window.rem_size());
 
         match width_setting {
-            ModalWidthContent::Small => small_width,
-            ModalWidthContent::Full => window_width,
-            ModalWidthContent::XLarge => (window_width - px(512.)).max(small_width),
-            ModalWidthContent::Large => (window_width - px(768.)).max(small_width),
-            ModalWidthContent::Medium => (window_width - px(1024.)).max(small_width),
+            ModalWidth::Small => small_width,
+            ModalWidth::Full => window_width,
+            ModalWidth::XLarge => (window_width - px(512.)).max(small_width),
+            ModalWidth::Large => (window_width - px(768.)).max(small_width),
+            ModalWidth::Medium => (window_width - px(1024.)).max(small_width),
         }
     }
 }

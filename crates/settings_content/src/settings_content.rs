@@ -708,7 +708,7 @@ pub struct FileFinderSettingsContent {
     /// Determines how much space the file finder can take up in relation to the available window width.
     ///
     /// Default: small
-    pub modal_max_width: Option<ModalWidthContent>,
+    pub modal_max_width: Option<ModalWidth>,
     /// Determines whether the file finder should skip focus for the active file in search results.
     ///
     /// Default: true
@@ -730,7 +730,7 @@ pub struct CommandPaletteSettingsContent {
     /// Determines how much space the command palette can take up in relation to the available window width.
     ///
     /// Default: small
-    pub modal_max_width: Option<ModalWidthContent>,
+    pub modal_max_width: Option<ModalWidth>,
 }
 
 #[derive(
@@ -773,7 +773,7 @@ pub enum IncludeIgnoredContent {
     strum::VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
-pub enum ModalWidthContent {
+pub enum ModalWidth {
     #[default]
     Small,
     Medium,
