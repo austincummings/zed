@@ -1465,6 +1465,14 @@ impl Workspace {
             },
         )
         .detach();
+        cx.subscribe_in(
+            &project.read(cx).bookmark_store(),
+            window,
+            |workspace, _, _event, window, cx| {
+                workspace.serialize_workspace(window, cx);
+            },
+        )
+        .detach();
         if let Some(toolchain_store) = project.read(cx).toolchain_store() {
             cx.subscribe_in(
                 &toolchain_store,
@@ -6060,6 +6068,9 @@ impl Workspace {
                         .read(cx)
                         .all_source_breakpoints(cx)
                 });
+                let bookmarks = self.project.update(cx, |project, cx| {
+                    project.bookmark_store().read(cx).all_source_bookmarks(cx)
+                });
                 let user_toolchains = self
                     .project
                     .read(cx)
@@ -6081,6 +6092,7 @@ impl Workspace {
                     centered_layout: self.centered_layout,
                     session_id: self.session_id.clone(),
                     breakpoints,
+                    bookmarks,
                     window_id: Some(window.window_handle().window_id().as_u64()),
                     user_toolchains,
                 };
@@ -6293,6 +6305,14 @@ impl Workspace {
                             breakpoint_store
                                 .with_serialized_breakpoints(serialized_workspace.breakpoints, cx)
                         })
+                })
+                .await;
+
+            let _ = project
+                .update(cx, |project, cx| {
+                    project.bookmark_store().update(cx, |bookmark_store, cx| {
+                        bookmark_store.with_serialized_bookmarks(serialized_workspace.bookmarks, cx)
+                    })
                 })
                 .await;
 

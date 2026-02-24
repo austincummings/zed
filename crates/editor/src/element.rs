@@ -642,6 +642,9 @@ impl EditorElement {
         register_action(editor, window, Editor::insert_uuid_v4);
         register_action(editor, window, Editor::insert_uuid_v7);
         register_action(editor, window, Editor::open_selections_in_multibuffer);
+        register_action(editor, window, Editor::toggle_bookmark);
+        register_action(editor, window, Editor::go_to_next_bookmark);
+        register_action(editor, window, Editor::go_to_previous_bookmark);
         register_action(editor, window, Editor::toggle_breakpoint);
         register_action(editor, window, Editor::edit_log_breakpoint);
         register_action(editor, window, Editor::enable_breakpoint);
@@ -3142,6 +3145,67 @@ impl EditorElement {
                     }
 
                     let button = editor.render_breakpoint(text_anchor, display_row, &bp, state, cx);
+
+                    let button = prepaint_gutter_button(
+                        button.into_any_element(),
+                        display_row,
+                        line_height,
+                        gutter_dimensions,
+                        scroll_position,
+                        gutter_hitbox,
+                        window,
+                        cx,
+                    );
+                    Some(button)
+                })
+                .collect_vec()
+        })
+    }
+
+    fn layout_bookmarks(
+        &self,
+        line_height: Pixels,
+        range: Range<DisplayRow>,
+        scroll_position: gpui::Point<ScrollOffset>,
+        gutter_dimensions: &GutterDimensions,
+        gutter_hitbox: &Hitbox,
+        snapshot: &EditorSnapshot,
+        bookmarks: HashMap<DisplayRow, (Anchor, project::bookmark_store::BookmarkWithPosition)>,
+        row_infos: &[RowInfo],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        if self.split_side == Some(SplitSide::Left) {
+            return Vec::new();
+        }
+
+        self.editor.update(cx, |editor, cx| {
+            bookmarks
+                .into_iter()
+                .filter_map(|(display_row, (text_anchor, _bookmark))| {
+                    if row_infos
+                        .get((display_row.0.saturating_sub(range.start.0)) as usize)
+                        .is_some_and(|row_info| {
+                            row_info.expand_info.is_some()
+                                || row_info
+                                    .diff_status
+                                    .is_some_and(|status| status.is_deleted())
+                        })
+                    {
+                        return None;
+                    }
+
+                    if range.start > display_row || range.end < display_row {
+                        return None;
+                    }
+
+                    let row =
+                        MultiBufferRow(DisplayPoint::new(display_row, 0).to_point(snapshot).row);
+                    if snapshot.is_line_folded(row) {
+                        return None;
+                    }
+
+                    let button = editor.render_bookmark(text_anchor, display_row, cx);
 
                     let button = prepaint_gutter_button(
                         button.into_any_element(),
@@ -6315,6 +6379,10 @@ impl EditorElement {
 
             for breakpoint in layout.breakpoints.iter_mut() {
                 breakpoint.paint(window, cx);
+            }
+
+            for bookmark in layout.bookmarks.iter_mut() {
+                bookmark.paint(window, cx);
             }
 
             for test_indicator in layout.test_indicators.iter_mut() {
@@ -9991,6 +10059,9 @@ impl Element for EditorElement {
                     let mut breakpoint_rows = self.editor.update(cx, |editor, cx| {
                         editor.active_breakpoints(start_row..end_row, window, cx)
                     });
+                    let bookmark_rows = self.editor.update(cx, |editor, cx| {
+                        editor.active_bookmarks(start_row..end_row, window, cx)
+                    });
                     for (display_row, (_, bp, state)) in &breakpoint_rows {
                         if bp.is_enabled() && state.is_none_or(|s| s.verified) {
                             active_rows.entry(*display_row).or_default().breakpoint = true;
@@ -10624,6 +10695,23 @@ impl Element for EditorElement {
                         Vec::new()
                     };
 
+                    let bookmark_elements = if !bookmark_rows.is_empty() {
+                        self.layout_bookmarks(
+                            line_height,
+                            start_row..end_row,
+                            scroll_position,
+                            &gutter_dimensions,
+                            &gutter_hitbox,
+                            &snapshot,
+                            bookmark_rows,
+                            &row_infos,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+
                     let git_gutter_width = Self::gutter_strip_width(line_height)
                         + gutter_dimensions
                             .git_blame_entries_width
@@ -10908,6 +10996,7 @@ impl Element for EditorElement {
                         mouse_context_menu,
                         test_indicators,
                         breakpoints,
+                        bookmarks: bookmark_elements,
                         diff_review_button,
                         crease_toggles,
                         crease_trailers,
@@ -11087,6 +11176,7 @@ pub struct EditorLayout {
     selections: Vec<(PlayerColor, Vec<SelectionLayout>)>,
     test_indicators: Vec<AnyElement>,
     breakpoints: Vec<AnyElement>,
+    bookmarks: Vec<AnyElement>,
     diff_review_button: Option<AnyElement>,
     crease_toggles: Vec<Option<AnyElement>>,
     expand_toggles: Vec<Option<(AnyElement, gpui::Point<Pixels>)>>,

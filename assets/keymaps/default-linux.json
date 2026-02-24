@@ -134,6 +134,9 @@
       "ctrl-alt-shift-e": "editor::ToggleEditPrediction",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",
+      "ctrl-f2": "editor::ToggleBookmark",
+      "f2": "editor::GoToNextBookmark",
+      "shift-f2": "editor::GoToPreviousBookmark",
     },
   },
   {

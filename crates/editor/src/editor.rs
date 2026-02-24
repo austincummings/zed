@@ -159,6 +159,7 @@ use project::{
     CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint, InlayId,
     InvalidationStrategy, Location, LocationLink, LspAction, PrepareRenameResponse, Project,
     ProjectItem, ProjectPath, ProjectTransaction, TaskSourceKind,
+    bookmark_store::{BookmarkStore, BookmarkWithPosition},
     debugger::{
         breakpoint_store::{
             Breakpoint, BreakpointEditAction, BreakpointSessionState, BreakpointState,
@@ -1294,6 +1295,7 @@ pub struct Editor {
     expect_bounds_change: Option<Bounds<Pixels>>,
     tasks: BTreeMap<(BufferId, BufferRow), RunnableTasks>,
     tasks_update_task: Option<Task<()>>,
+    bookmark_store: Option<Entity<BookmarkStore>>,
     breakpoint_store: Option<Entity<BreakpointStore>>,
     gutter_breakpoint_indicator: (Option<PhantomBreakpointIndicator>, Option<Task<()>>),
     pub(crate) gutter_diff_review_indicator: (Option<PhantomDiffReviewIndicator>, Option<Task<()>>),
@@ -2353,6 +2355,11 @@ impl Editor {
             _ => None,
         };
 
+        let bookmark_store = match (&mode, project.as_ref()) {
+            (EditorMode::Full { .. }, Some(project)) => Some(project.read(cx).bookmark_store()),
+            _ => None,
+        };
+
         let mut code_action_providers = Vec::new();
         let mut load_uncommitted_diff = None;
         if let Some(project) = project.clone() {
@@ -2522,6 +2529,7 @@ impl Editor {
             blame_subscription: None,
             tasks: BTreeMap::default(),
 
+            bookmark_store,
             breakpoint_store,
             gutter_breakpoint_indicator: (None, None),
             gutter_diff_review_indicator: (None, None),
@@ -8833,6 +8841,59 @@ impl Editor {
         breakpoint_display_points
     }
 
+    pub(crate) fn active_bookmarks(
+        &self,
+        range: Range<DisplayRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> HashMap<DisplayRow, (Anchor, BookmarkWithPosition)> {
+        let mut bookmark_display_points = HashMap::default();
+
+        let Some(bookmark_store) = self.bookmark_store.clone() else {
+            return bookmark_display_points;
+        };
+
+        let snapshot = self.snapshot(window, cx);
+        let multi_buffer_snapshot = snapshot.buffer_snapshot();
+        let Some(project) = self.project() else {
+            return bookmark_display_points;
+        };
+
+        let range = snapshot.display_point_to_point(DisplayPoint::new(range.start, 0), Bias::Left)
+            ..snapshot.display_point_to_point(DisplayPoint::new(range.end, 0), Bias::Right);
+
+        for (buffer_snapshot, buffer_range, excerpt_id) in
+            multi_buffer_snapshot.range_to_buffer_ranges(range.start..=range.end)
+        {
+            let Some(buffer) = project
+                .read(cx)
+                .buffer_for_id(buffer_snapshot.remote_id(), cx)
+            else {
+                continue;
+            };
+            let bookmarks = bookmark_store.read(cx).bookmarks(
+                &buffer,
+                Some(
+                    buffer_snapshot.anchor_before(buffer_range.start)
+                        ..buffer_snapshot.anchor_after(buffer_range.end),
+                ),
+                buffer_snapshot,
+                cx,
+            );
+            for bookmark in bookmarks {
+                let multi_buffer_anchor = Anchor::in_buffer(excerpt_id, bookmark.position);
+                let position = multi_buffer_anchor
+                    .to_point(&multi_buffer_snapshot)
+                    .to_display_point(&snapshot);
+
+                bookmark_display_points
+                    .insert(position.row(), (multi_buffer_anchor, bookmark.clone()));
+            }
+        }
+
+        bookmark_display_points
+    }
+
     fn breakpoint_context_menu(
         &self,
         anchor: Anchor,
@@ -9119,6 +9180,38 @@ impl Editor {
                     cx,
                 )
             })
+    }
+
+    pub(crate) fn render_bookmark(
+        &self,
+        _position: Anchor,
+        row: DisplayRow,
+        cx: &mut Context<Self>,
+    ) -> IconButton {
+        let focus_handle = self.focus_handle.clone();
+        IconButton::new(
+            ("bookmark_indicator", row.0 as usize),
+            ui::IconName::Bookmark,
+        )
+        .icon_size(IconSize::XSmall)
+        .size(ui::ButtonSize::None)
+        .icon_color(Color::Accent)
+        .style(ButtonStyle::Transparent)
+        .on_click(cx.listener({
+            move |editor, _event: &ClickEvent, window, cx| {
+                window.focus(&editor.focus_handle(cx), cx);
+                editor.toggle_bookmark(&crate::actions::ToggleBookmark, window, cx);
+            }
+        }))
+        .tooltip(move |_window, cx| {
+            Tooltip::with_meta_in(
+                "Toggle bookmark",
+                Some(&crate::actions::ToggleBookmark),
+                SharedString::default(),
+                &focus_handle,
+                cx,
+            )
+        })
     }
 
     fn build_tasks_context(
@@ -12049,6 +12142,184 @@ impl Editor {
     #[cfg(any(test, feature = "test-support"))]
     pub fn breakpoint_store(&self) -> Option<Entity<BreakpointStore>> {
         self.breakpoint_store.clone()
+    }
+
+    pub fn toggle_bookmark(
+        &mut self,
+        _: &crate::actions::ToggleBookmark,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bookmark_store) = self.bookmark_store.clone() else {
+            return;
+        };
+        let Some(project) = self.project() else {
+            return;
+        };
+
+        let snapshot = self.snapshot(window, cx);
+        let multi_buffer_snapshot = snapshot.buffer_snapshot();
+
+        let mut selections = self.selections.all::<Point>(&snapshot.display_snapshot);
+        selections.sort_by_key(|s| s.head());
+        selections.dedup_by_key(|s| s.head().row);
+
+        for selection in &selections {
+            let head = selection.head();
+            let anchor = multi_buffer_snapshot.anchor_before(head);
+
+            if let Some((buffer_snapshot, _, _excerpt_id)) = multi_buffer_snapshot
+                .range_to_buffer_ranges(head..=head)
+                .into_iter()
+                .next()
+            {
+                if let Some(buffer) = project
+                    .read(cx)
+                    .buffer_for_id(buffer_snapshot.remote_id(), cx)
+                {
+                    let text_anchor = anchor.text_anchor;
+                    bookmark_store.update(cx, |store, cx| {
+                        store.toggle_bookmark(buffer, text_anchor, None, cx);
+                    });
+                }
+            }
+        }
+
+        cx.notify();
+    }
+
+    pub fn go_to_next_bookmark(
+        &mut self,
+        _: &crate::actions::GoToNextBookmark,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bookmark_store) = self.bookmark_store.clone() else {
+            return;
+        };
+        let Some(project) = self.project() else {
+            return;
+        };
+
+        let snapshot = self.snapshot(window, cx);
+        let multi_buffer_snapshot = snapshot.buffer_snapshot();
+
+        let cursor_point = self
+            .selections
+            .newest::<Point>(&snapshot.display_snapshot)
+            .head();
+        let cursor_row = cursor_point.row;
+
+        for (buffer_snapshot, _, _excerpt_id) in multi_buffer_snapshot
+            .range_to_buffer_ranges(Point::zero()..=multi_buffer_snapshot.max_point())
+        {
+            let Some(buffer) = project
+                .read(cx)
+                .buffer_for_id(buffer_snapshot.remote_id(), cx)
+            else {
+                continue;
+            };
+
+            let bookmarks: Vec<_> = bookmark_store
+                .read(cx)
+                .bookmarks(&buffer, None, &buffer_snapshot, cx)
+                .collect();
+
+            let mut best: Option<u32> = None;
+            let mut first: Option<u32> = None;
+
+            for bm in &bookmarks {
+                let row = bm.position.summary::<Point>(&buffer_snapshot).row;
+                if first.is_none() || row < first.unwrap_or(u32::MAX) {
+                    first = Some(row);
+                }
+                if row > cursor_row && (best.is_none() || row < best.unwrap_or(u32::MAX)) {
+                    best = Some(row);
+                }
+            }
+
+            let target_row = best.or(first);
+
+            if let Some(row) = target_row {
+                let point = multi_buffer_snapshot.clip_point(Point::new(row, 0), Bias::Left);
+                self.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |s| {
+                        s.select_ranges([point..point]);
+                    },
+                );
+                return;
+            }
+        }
+    }
+
+    pub fn go_to_previous_bookmark(
+        &mut self,
+        _: &crate::actions::GoToPreviousBookmark,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bookmark_store) = self.bookmark_store.clone() else {
+            return;
+        };
+        let Some(project) = self.project() else {
+            return;
+        };
+
+        let snapshot = self.snapshot(window, cx);
+        let multi_buffer_snapshot = snapshot.buffer_snapshot();
+
+        let cursor_point = self
+            .selections
+            .newest::<Point>(&snapshot.display_snapshot)
+            .head();
+        let cursor_row = cursor_point.row;
+
+        for (buffer_snapshot, _, _excerpt_id) in multi_buffer_snapshot
+            .range_to_buffer_ranges(Point::zero()..=multi_buffer_snapshot.max_point())
+        {
+            let Some(buffer) = project
+                .read(cx)
+                .buffer_for_id(buffer_snapshot.remote_id(), cx)
+            else {
+                continue;
+            };
+
+            let bookmarks: Vec<_> = bookmark_store
+                .read(cx)
+                .bookmarks(&buffer, None, &buffer_snapshot, cx)
+                .collect();
+
+            let mut best: Option<u32> = None;
+            let mut last: Option<u32> = None;
+
+            for bm in &bookmarks {
+                let row = bm.position.summary::<Point>(&buffer_snapshot).row;
+                if last.is_none() || row > last.unwrap_or(0) {
+                    last = Some(row);
+                }
+                if row < cursor_row && (best.is_none() || row > best.unwrap_or(0)) {
+                    best = Some(row);
+                }
+            }
+
+            let target_row = best.or(last);
+
+            if let Some(row) = target_row {
+                let point = multi_buffer_snapshot.clip_point(Point::new(row, 0), Bias::Left);
+                self.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |s| {
+                        s.select_ranges([point..point]);
+                    },
+                );
+                return;
+            }
+        }
     }
 
     pub fn prepare_restore_change(

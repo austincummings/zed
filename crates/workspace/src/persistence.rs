@@ -21,6 +21,7 @@ use db::{
 };
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::{
+    bookmark_store::SourceBookmark,
     debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
@@ -970,6 +971,17 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE remote_connections ADD COLUMN use_podman BOOLEAN;
         ),
+        sql!(
+            CREATE TABLE bookmarks (
+                workspace_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                label TEXT,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+            );
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1105,6 +1117,7 @@ impl WorkspaceDb {
             docks,
             session_id: None,
             breakpoints: self.breakpoints(workspace_id),
+            bookmarks: self.bookmarks(workspace_id),
             window_id,
             user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
         })
@@ -1195,9 +1208,39 @@ impl WorkspaceDb {
             docks,
             session_id: None,
             breakpoints: self.breakpoints(workspace_id),
+            bookmarks: self.bookmarks(workspace_id),
             window_id,
             user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
         })
+    }
+
+    fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SourceBookmark>> {
+        let rows: Result<Vec<(PathBuf, i32, Option<String>)>> = self
+            .select_bound(sql! {
+                SELECT path, line, label
+                FROM bookmarks
+                WHERE workspace_id = ?
+            })
+            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
+
+        match rows {
+            Ok(rows) => {
+                let mut map: BTreeMap<Arc<Path>, Vec<SourceBookmark>> = Default::default();
+                for (path, line, label) in rows {
+                    let path: Arc<Path> = path.into();
+                    map.entry(path.clone()).or_default().push(SourceBookmark {
+                        row: line as u32,
+                        path,
+                        label: label.map(Arc::from),
+                    });
+                }
+                map
+            }
+            Err(msg) => {
+                log::error!("Bookmarks query failed: {msg}");
+                Default::default()
+            }
+        }
     }
 
     fn breakpoints(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> {
@@ -1346,6 +1389,29 @@ impl WorkspaceDb {
                         DELETE FROM breakpoints WHERE workspace_id = ?1;
                     )
                 )?(workspace.id).context("Clearing old breakpoints")?;
+
+                conn.exec_bound(
+                    sql!(
+                        DELETE FROM bookmarks WHERE workspace_id = ?1;
+                    )
+                )?(workspace.id).context("Clearing old bookmarks")?;
+
+                for (path, file_bookmarks) in &workspace.bookmarks {
+                    for bm in file_bookmarks {
+                        if let Err(err) = conn.exec_bound(sql!(
+                            INSERT INTO bookmarks (workspace_id, path, line, label)
+                            VALUES (?1, ?2, ?3, ?4);))?(
+                            (
+                                workspace.id,
+                                path.as_ref(),
+                                bm.row,
+                                bm.label.clone(),
+                            )
+                        ) {
+                            log::error!("Failed to save bookmark: {err}");
+                        }
+                    }
+                }
 
                 for (path, breakpoints) in workspace.breakpoints {
                     for bp in breakpoints {

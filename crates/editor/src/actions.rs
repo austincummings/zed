@@ -803,6 +803,12 @@ actions!(
         Tab,
         /// Removes a tab character or outdents.
         Backtab,
+        /// Toggles a bookmark at the current line.
+        ToggleBookmark,
+        /// Navigates to the next bookmark in the current buffer.
+        GoToNextBookmark,
+        /// Navigates to the previous bookmark in the current buffer.
+        GoToPreviousBookmark,
         /// Toggles a breakpoint at the current line.
         ToggleBreakpoint,
         /// Toggles the case of selected text.
