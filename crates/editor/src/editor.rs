@@ -12144,6 +12144,11 @@ impl Editor {
         self.breakpoint_store.clone()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn bookmark_store(&self) -> Option<Entity<BookmarkStore>> {
+        self.bookmark_store.clone()
+    }
+
     pub fn toggle_bookmark(
         &mut self,
         _: &crate::actions::ToggleBookmark,
