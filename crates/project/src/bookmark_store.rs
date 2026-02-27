@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use anyhow::Result;
 use gpui::{App, Context, Entity, EventEmitter, Subscription, Task};
-use language::{Buffer, BufferEvent, BufferSnapshot, Point, PointUtf16};
+use language::{Buffer, BufferEvent, BufferSnapshot, Point};
 use text;
 use worktree;
 
@@ -211,9 +211,7 @@ impl BookmarkStore {
                         .bookmarks
                         .iter()
                         .map(|bookmark| {
-                            let row = snapshot
-                                .summary_for_anchor::<PointUtf16>(&bookmark.position)
-                                .row;
+                            let row = snapshot.summary_for_anchor::<Point>(&bookmark.position).row;
                             SourceBookmark {
                                 row,
                                 path: path.clone(),
@@ -273,8 +271,8 @@ impl BookmarkStore {
                     this.update(cx, |_, cx| BookmarksInFile::new(buffer, cx))?;
 
                 for source_bookmark in source_bookmarks {
-                    let max_point = snapshot.max_point_utf16();
-                    let point = PointUtf16::new(source_bookmark.row, 0);
+                    let max_point = snapshot.max_point();
+                    let point = Point::new(source_bookmark.row, 0);
                     if point > max_point {
                         log::error!("Skipping a deserialized bookmark that's out of range");
                         continue;

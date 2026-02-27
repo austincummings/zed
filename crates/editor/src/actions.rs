@@ -652,6 +652,8 @@ actions!(
         NextScreen,
         /// Goes to the next snippet tabstop if one exists.
         NextSnippetTabstop,
+        /// Opens project bookmarks in a multibuffer.
+        OpenBookmarks,
         /// Opens the context menu at cursor position.
         OpenContextMenu,
         /// Opens excerpts from the current file.

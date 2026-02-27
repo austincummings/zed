@@ -340,6 +340,7 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(
         |workspace: &mut Workspace, _: Option<&mut Window>, _cx: &mut Context<Workspace>| {
+            workspace.register_action(Editor::open_bookmarks);
             workspace.register_action(Editor::new_file);
             workspace.register_action(Editor::new_file_split);
             workspace.register_action(Editor::new_file_vertical);
@@ -25149,6 +25150,97 @@ impl Editor {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(lines));
+    }
+
+    pub fn open_bookmarks(
+        workspace: &mut Workspace,
+        _: &OpenBookmarks,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        // println!("Bookmarks: {:#?}", bookmarks);
+
+        // let locations = bookmarks
+        //     .iter()
+        //     .filter_map(|(path, bookmark)| {
+        //         let project_path = project.project_path_for_absolute_path(path, cx)?;
+        //         let buffer = project.open_buffer(project_path, cx);
+
+        //         // let snapshot = buffer.read(cx).snapshot();
+        //         // let point = Point::new(bookmark.row, 0);
+        //         // if point > snapshot.max_point() {
+        //         //     None
+        //         // } else {
+        //         //     Some((buffer.clone(), point..point))
+        //         // }
+        //     })
+        //     .collect::<std::collections::HashMap<_, _>>();
+
+        // Editor::open_locations_in_multibuffer(
+        //     workspace,
+        //     locations,
+        //     "Bookmarks".to_string(),
+        //     false, // split
+        //     true,  // allow_preview
+        //     MultibufferSelectionMode::All,
+        //     window,
+        //     cx,
+        // );
+
+        let bookmarks = workspace
+            .project()
+            .read(cx)
+            .bookmark_store()
+            .read(cx)
+            .all_bookmarks();
+        let project_paths = bookmarks
+            .iter()
+            .filter_map(|(path, _bookmark)| {
+                workspace
+                    .project()
+                    .read(cx)
+                    .project_path_for_absolute_path(path, cx)
+            })
+            .collect::<Vec<_>>();
+        cx.spawn_in(window, async move |this, cx| {
+            let tasks = this.update(cx, |workspace, cx| {
+                let project = workspace.project().clone();
+                project.update(cx, |project, cx| {
+                    project_paths
+                        .into_iter()
+                        .map(|path| project.open_buffer(path, cx))
+                        .collect::<Vec<_>>()
+                })
+            })?;
+
+            let buffers = futures::future::join_all(tasks).await;
+
+            println!("Buffers: {:?}", buffers);
+
+            let mut locations: std::collections::HashMap<Entity<Buffer>, Vec<Range<Point>>> =
+                std::collections::HashMap::default();
+            for buffer in buffers.into_iter().filter_map(|b| b.ok()) {
+                let snapshot = buffer.read_with(cx, |b, _| b.snapshot());
+                let range = Point::new(0, 0)..snapshot.max_point();
+                locations.insert(buffer, vec![range]);
+            }
+
+            this.update_in(cx, |workspace, window, cx| {
+                Editor::open_locations_in_multibuffer(
+                    workspace,
+                    locations,
+                    "Bookmarks".to_string(),
+                    false,
+                    true,
+                    MultibufferSelectionMode::All,
+                    window,
+                    cx,
+                );
+            })?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     pub fn open_context_menu(

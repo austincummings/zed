@@ -37,6 +37,7 @@ use dap::inline_value::{InlineValueLocation, VariableLookupKind, VariableScope};
 use itertools::Either;
 
 use crate::{
+    bookmark_store::BookmarkStore,
     git_store::GitStore,
     lsp_store::{SymbolLocation, log_store::LogKind},
     project_search::SearchResultsHandle,
@@ -211,7 +212,7 @@ pub struct Project {
     dap_store: Entity<DapStore>,
     agent_server_store: Entity<AgentServerStore>,
 
-    bookmark_store: Entity<bookmark_store::BookmarkStore>,
+    bookmark_store: Entity<BookmarkStore>,
     breakpoint_store: Entity<BreakpointStore>,
     collab_client: Arc<client::Client>,
     join_project_response_message_id: u32,
@@ -2066,7 +2067,7 @@ impl Project {
     }
 
     #[inline]
-    pub fn bookmark_store(&self) -> Entity<bookmark_store::BookmarkStore> {
+    pub fn bookmark_store(&self) -> Entity<BookmarkStore> {
         self.bookmark_store.clone()
     }
 
