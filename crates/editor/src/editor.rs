@@ -11981,6 +11981,33 @@ impl Editor {
         }
     }
 
+    pub fn toggle_bookmark(
+        &mut self,
+        _: &crate::actions::ToggleBookmark,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        println!("toggle bookmark");
+    }
+
+    pub fn go_to_next_bookmark(
+        &mut self,
+        _: &crate::actions::GoToNextBookmark,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        println!("go to next bookmark");
+    }
+
+    pub fn go_to_previous_bookmark(
+        &mut self,
+        _: &crate::actions::GoToPreviousBookmark,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        println!("go to previous bookmark");
+    }
+
     pub fn toggle_breakpoint(
         &mut self,
         _: &crate::actions::ToggleBreakpoint,

@@ -562,10 +562,14 @@ actions!(
         GoToImplementation,
         /// Goes to implementation in a split pane.
         GoToImplementationSplit,
+        /// Goes to the next bookmark in the file.
+        GoToNextBookmark,
         /// Goes to the next change in the file.
         GoToNextChange,
         /// Goes to the parent module of the current file.
         GoToParentModule,
+        /// Goes to the previous bookmark in the file.
+        GoToPreviousBookmark,
         /// Goes to the previous change in the file.
         GoToPreviousChange,
         /// Goes to the next reference to the symbol under the cursor.
@@ -803,6 +807,8 @@ actions!(
         Tab,
         /// Removes a tab character or outdents.
         Backtab,
+        /// Toggles a bookmark at the current line.
+        ToggleBookmark,
         /// Toggles a breakpoint at the current line.
         ToggleBreakpoint,
         /// Toggles the case of selected text.

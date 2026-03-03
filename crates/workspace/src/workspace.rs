@@ -221,6 +221,8 @@ actions!(
         ActivatePreviousWindow,
         /// Adds a folder to the current project.
         AddFolderToProject,
+        /// Clears all bookmarks in the project.
+        ClearBookmarks,
         /// Clears all notifications.
         ClearAllNotifications,
         /// Clears all navigation history, including forward/backward navigation, recently opened files, and recently closed tabs. **This action is irreversible**.
@@ -301,6 +303,8 @@ actions!(
         ClearTrustedWorktrees,
         /// Stops following a collaborator.
         Unfollow,
+        /// Opens a view of all bookmarks in the project.
+        ViewBookmarks,
         /// Restores the banner.
         RestoreBanner,
         /// Toggles expansion of the selected item.
@@ -6742,6 +6746,8 @@ impl Workspace {
                     }
                 }),
             )
+            .on_action(cx.listener(Workspace::clear_bookmarks))
+            .on_action(cx.listener(Workspace::view_bookmarks))
             .on_action(cx.listener(Workspace::cancel))
     }
 
@@ -6861,6 +6867,14 @@ impl Workspace {
                 .detach_and_log_err(cx);
         }
         cx.notify();
+    }
+
+    pub fn clear_bookmarks(&mut self, _: &ClearBookmarks, _: &mut Window, _cx: &mut Context<Self>) {
+        println!("clear bookmarks");
+    }
+
+    pub fn view_bookmarks(&mut self, _: &ViewBookmarks, _: &mut Window, _cx: &mut Context<Self>) {
+        println!("view bookmarks");
     }
 
     fn adjust_padding(padding: Option<f32>) -> f32 {
