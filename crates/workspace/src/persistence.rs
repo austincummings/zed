@@ -21,7 +21,7 @@ use db::{
 };
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::{
-    bookmark_store::BookmarkRow,
+    bookmark_store::SerializedBookmark,
     debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
@@ -371,12 +371,14 @@ pub async fn write_default_dock_state(docks: DockStructure) -> anyhow::Result<()
 #[derive(Debug)]
 pub struct Bookmark {
     pub row: u32,
+    pub symbol_path: Option<String>,
+    pub offset_in_symbol: Option<u32>,
 }
 
 impl sqlez::bindable::StaticColumnCount for Bookmark {
     fn column_count() -> usize {
-        // row
-        1
+        // row, symbol_path, offset_in_symbol
+        3
     }
 }
 
@@ -386,7 +388,15 @@ impl sqlez::bindable::Bind for Bookmark {
         statement: &sqlez::statement::Statement,
         start_index: i32,
     ) -> anyhow::Result<i32> {
-        statement.bind(&self.row, start_index)
+        let next_index = statement.bind(&self.row, start_index)?;
+        let next_index = match &self.symbol_path {
+            Some(path) => statement.bind(path, next_index)?,
+            None => statement.bind(&None::<&str>, next_index)?,
+        };
+        match self.offset_in_symbol {
+            Some(offset) => statement.bind(&(offset as i32), next_index),
+            None => statement.bind(&None::<i32>, next_index),
+        }
     }
 }
 
@@ -394,10 +404,24 @@ impl Column for Bookmark {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let row = statement
             .column_int(start_index)
-            .with_context(|| format!("Failed to read bookmark at index {start_index}"))?
+            .with_context(|| format!("Failed to read bookmark row at index {start_index}"))?
             as u32;
 
-        Ok((Bookmark { row }, start_index + 1))
+        let symbol_path = statement
+            .column_text(start_index + 1)
+            .ok()
+            .map(|s| s.to_string());
+
+        let offset_in_symbol = statement.column_int(start_index + 2).ok().map(|v| v as u32);
+
+        Ok((
+            Bookmark {
+                row,
+                symbol_path,
+                offset_in_symbol,
+            },
+            start_index + 3,
+        ))
     }
 }
 
@@ -1014,6 +1038,10 @@ impl Domain for WorkspaceDb {
                 ON UPDATE CASCADE
             );
         ),
+        sql!(
+            ALTER TABLE bookmarks ADD COLUMN symbol_path TEXT;
+            ALTER TABLE bookmarks ADD COLUMN offset_in_symbol INTEGER;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1246,10 +1274,10 @@ impl WorkspaceDb {
         })
     }
 
-    fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<BookmarkRow>> {
+    fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
         let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
             .select_bound(sql! {
-                SELECT path, row
+                SELECT path, row, symbol_path, offset_in_symbol
                 FROM bookmarks
                 WHERE workspace_id = ?
                 ORDER BY path, row
@@ -1262,13 +1290,20 @@ impl WorkspaceDb {
                     log::debug!("Bookmarks are empty after querying database for them");
                 }
 
-                let mut map: BTreeMap<Arc<Path>, Vec<BookmarkRow>> = BTreeMap::default();
+                let mut map: BTreeMap<Arc<Path>, Vec<SerializedBookmark>> = BTreeMap::default();
 
                 for (path, bookmark) in bookmarks {
                     let path: Arc<Path> = path.into();
+                    let symbol_path = bookmark
+                        .symbol_path
+                        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
                     map.entry(path.clone())
                         .or_default()
-                        .push(BookmarkRow(bookmark.row))
+                        .push(SerializedBookmark {
+                            row: bookmark.row,
+                            symbol_path,
+                            offset_in_symbol: bookmark.offset_in_symbol,
+                        });
                 }
 
                 map
@@ -1429,10 +1464,15 @@ impl WorkspaceDb {
 
                 for (path, bookmarks) in workspace.bookmarks {
                     for bookmark in bookmarks {
+                        let symbol_path_json = bookmark
+                            .symbol_path
+                            .as_ref()
+                            .and_then(|sp| serde_json::to_string(sp).ok());
+                        let offset_in_symbol = bookmark.offset_in_symbol.map(|v| v as i32);
                         conn.exec_bound(sql!(
-                            INSERT INTO bookmarks (workspace_id, path, row)
-                            VALUES (?1, ?2, ?3);
-                        ))?((workspace.id, path.as_ref(), bookmark.0)).context("Inserting bookmark")?;
+                            INSERT INTO bookmarks (workspace_id, path, row, symbol_path, offset_in_symbol)
+                            VALUES (?1, ?2, ?3, ?4, ?5);
+                        ))?((workspace.id, path.as_ref(), bookmark.row, symbol_path_json, offset_in_symbol)).context("Inserting bookmark")?;
                     }
                 }
 

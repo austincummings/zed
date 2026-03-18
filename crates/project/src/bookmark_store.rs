@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::Result;
 use gpui::{App, Context, Entity, Subscription, Task};
-use language::{Buffer, BufferEvent};
-use text::{BufferSnapshot, Point};
+use language::{Buffer, BufferEvent, OutlineItem};
+use text::{Anchor, BufferSnapshot, Point, ToPoint};
 
 use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
 
@@ -21,8 +21,19 @@ impl BookmarkAnchor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BookmarkRow(pub u32);
+/// A bookmark serialized with optional syntactic context for cross-session stability.
+/// When a symbol_path is present, restoration will attempt to locate the matching
+/// syntactic construct first, falling back to the raw row number if not found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerializedBookmark {
+    /// The row number at time of serialization (fallback anchor).
+    pub row: u32,
+    /// Hierarchical path of enclosing outline symbol names, from outermost to innermost.
+    /// e.g. `["impl DataProcessor", "fn process"]`
+    pub symbol_path: Option<Vec<String>>,
+    /// Row offset of the bookmark relative to the start of the innermost symbol.
+    pub offset_in_symbol: Option<u32>,
+}
 
 #[derive(Debug)]
 pub struct BufferBookmarks {
@@ -62,7 +73,7 @@ impl BufferBookmarks {
 #[derive(Debug)]
 pub enum BookmarkEntry {
     Loaded(BufferBookmarks),
-    Unloaded(Vec<BookmarkRow>),
+    Unloaded(Vec<SerializedBookmark>),
 }
 
 impl BookmarkEntry {
@@ -91,21 +102,22 @@ impl BookmarkStore {
 
     pub fn with_serialized_bookmarks(
         &mut self,
-        bookmark_rows: BTreeMap<Arc<Path>, Vec<BookmarkRow>>,
+        bookmarks: BTreeMap<Arc<Path>, Vec<SerializedBookmark>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         self.bookmarks.clear();
 
-        for (path, rows) in bookmark_rows {
-            if rows.is_empty() {
+        for (path, serialized) in bookmarks {
+            if serialized.is_empty() {
                 continue;
             }
 
-            let count = rows.len();
+            let count = serialized.len();
             let word = if count == 1 { "bookmark" } else { "bookmarks" };
             log::debug!("Stored {count} unloaded {word} at {}", path.display());
 
-            self.bookmarks.insert(path, BookmarkEntry::Unloaded(rows));
+            self.bookmarks
+                .insert(path, BookmarkEntry::Unloaded(serialized));
         }
 
         cx.notify();
@@ -118,23 +130,36 @@ impl BookmarkStore {
         buffer: &Entity<Buffer>,
         cx: &mut Context<Self>,
     ) {
-        let Some(BookmarkEntry::Unloaded(rows)) = self.bookmarks.get(abs_path) else {
+        let Some(BookmarkEntry::Unloaded(serialized)) = self.bookmarks.get(abs_path) else {
             return;
         };
 
         let snapshot = buffer.read(cx).snapshot();
         let max_point = snapshot.max_point();
 
-        let anchors: Vec<BookmarkAnchor> = rows
-            .iter()
-            .filter_map(|bookmark_row| {
-                let point = Point::new(bookmark_row.0, 0);
+        let outline = snapshot.outline(None);
+        let outline_items: &[OutlineItem<Anchor>] = &outline.items;
 
+        let anchors: Vec<BookmarkAnchor> = serialized
+            .iter()
+            .filter_map(|bookmark| {
+                if let Some(resolved_row) =
+                    Self::resolve_syntactic_bookmark(bookmark, outline_items, &snapshot)
+                {
+                    let point = Point::new(resolved_row, 0);
+                    if point > max_point {
+                        return None;
+                    }
+                    let anchor = snapshot.anchor_after(point);
+                    return Some(BookmarkAnchor(anchor));
+                }
+
+                let point = Point::new(bookmark.row, 0);
                 if point > max_point {
                     log::warn!(
                         "Skipping out-of-range bookmark: {} row {} (file has {} rows)",
                         abs_path.display(),
-                        bookmark_row.0,
+                        bookmark.row,
                         max_point.row
                     );
                     return None;
@@ -153,6 +178,85 @@ impl BookmarkStore {
             self.bookmarks
                 .insert(abs_path.clone(), BookmarkEntry::Loaded(buffer_bookmarks));
         }
+    }
+
+    /// Attempt to resolve a bookmark using its syntactic context.
+    /// Returns the resolved row if a matching outline symbol is found.
+    fn resolve_syntactic_bookmark(
+        bookmark: &SerializedBookmark,
+        outline_items: &[OutlineItem<Anchor>],
+        snapshot: &language::BufferSnapshot,
+    ) -> Option<u32> {
+        let symbol_path = bookmark.symbol_path.as_ref()?;
+        if symbol_path.is_empty() {
+            return None;
+        }
+
+        let innermost_name = symbol_path.last()?;
+
+        // Find candidate items whose text matches the innermost symbol name.
+        let mut best_match: Option<(usize, &OutlineItem<Anchor>)> = None;
+
+        for (index, item) in outline_items.iter().enumerate() {
+            if &item.text != innermost_name {
+                continue;
+            }
+
+            // Verify the full ancestor chain matches.
+            if Self::matches_symbol_path(symbol_path, index, outline_items) {
+                best_match = Some((index, item));
+                // Take the first full match (outline items are in document order).
+                break;
+            }
+        }
+
+        // If exact match failed, try matching just the innermost name.
+        let matched_item = best_match.map(|(_, item)| item).or_else(|| {
+            outline_items
+                .iter()
+                .find(|item| &item.text == innermost_name)
+        })?;
+
+        let item_start_row = matched_item.range.start.to_point(snapshot).row;
+        let resolved_row = if let Some(offset) = bookmark.offset_in_symbol {
+            let item_end_row = matched_item.range.end.to_point(snapshot).row;
+            (item_start_row + offset).min(item_end_row)
+        } else {
+            item_start_row
+        };
+
+        Some(resolved_row)
+    }
+
+    /// Check whether the ancestor chain of an outline item matches the given symbol path.
+    fn matches_symbol_path(
+        symbol_path: &[String],
+        item_index: usize,
+        outline_items: &[OutlineItem<Anchor>],
+    ) -> bool {
+        if symbol_path.len() == 1 {
+            return true;
+        }
+
+        let target_depth = outline_items[item_index].depth;
+
+        // Walk backwards through the symbol path, matching ancestors.
+        let mut remaining_path: &[String] = &symbol_path[..symbol_path.len() - 1];
+        let mut current_depth = target_depth;
+
+        for item in outline_items[..item_index].iter().rev() {
+            if remaining_path.is_empty() {
+                break;
+            }
+            if item.depth < current_depth {
+                if &item.text == remaining_path.last().expect("checked non-empty above") {
+                    remaining_path = &remaining_path[..remaining_path.len() - 1];
+                }
+                current_depth = item.depth;
+            }
+        }
+
+        remaining_path.is_empty()
     }
 
     /// Opens buffers for all unloaded bookmark entries and resolves them to anchors.
@@ -234,6 +338,26 @@ impl BookmarkStore {
         worktree::File::from_dyn(buffer.read(cx).file())
             .map(|file| file.worktree.read(cx).absolutize(&file.path))
             .map(Arc::<Path>::from)
+    }
+
+    /// Compute the syntactic context for a bookmark at the given position.
+    /// Returns the symbol path and offset within the innermost symbol.
+    pub fn compute_syntactic_context(
+        snapshot: &language::BufferSnapshot,
+        row: u32,
+    ) -> (Option<Vec<String>>, Option<u32>) {
+        let symbols = snapshot.symbols_containing(Point::new(row, 0), None);
+        if symbols.is_empty() {
+            return (None, None);
+        }
+
+        let symbol_path: Vec<String> = symbols.iter().map(|item| item.text.clone()).collect();
+
+        let innermost = &symbols[symbols.len() - 1];
+        let item_start_row = innermost.range.start.to_point(snapshot).row;
+        let offset = row.saturating_sub(item_start_row);
+
+        (Some(symbol_path), Some(offset))
     }
 
     /// Toggle a bookmark at the given anchor in the buffer.
@@ -371,12 +495,15 @@ impl BookmarkStore {
         }
     }
 
-    pub fn all_serialized_bookmarks(&self, cx: &App) -> BTreeMap<Arc<Path>, Vec<BookmarkRow>> {
+    pub fn all_serialized_bookmarks(
+        &self,
+        cx: &App,
+    ) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
         self.bookmarks
             .iter()
             .filter_map(|(path, entry)| {
-                let mut rows = match entry {
-                    BookmarkEntry::Unloaded(rows) => rows.clone(),
+                let mut serialized = match entry {
+                    BookmarkEntry::Unloaded(bookmarks) => bookmarks.clone(),
                     BookmarkEntry::Loaded(buffer_bookmarks) => {
                         let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
                         buffer_bookmarks
@@ -388,19 +515,25 @@ impl BookmarkStore {
                                 }
                                 let row =
                                     snapshot.summary_for_anchor::<Point>(&bookmark.anchor()).row;
-                                Some(BookmarkRow(row))
+                                let (symbol_path, offset_in_symbol) =
+                                    Self::compute_syntactic_context(&snapshot, row);
+                                Some(SerializedBookmark {
+                                    row,
+                                    symbol_path,
+                                    offset_in_symbol,
+                                })
                             })
                             .collect()
                     }
                 };
 
-                rows.sort();
-                rows.dedup();
+                serialized.sort_by_key(|b| b.row);
+                serialized.dedup_by_key(|b| b.row);
 
-                if rows.is_empty() {
+                if serialized.is_empty() {
                     None
                 } else {
-                    Some((path.clone(), rows))
+                    Some((path.clone(), serialized))
                 }
             })
             .collect()
