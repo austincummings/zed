@@ -707,6 +707,56 @@ mod integration {
         language_registry.add(rust_lang());
     }
 
+    /// Sets up a test project with Rust language support and a single file.
+    /// Returns the project, the FakeFs, and the opened + parsed buffer.
+    async fn setup_rust_project(
+        source: &str,
+        filename: &str,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Arc<fs::FakeFs>, Entity<Buffer>) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ filename: source }))
+            .await;
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        register_rust_language(&project, cx);
+
+        let full_path = format!("/project/{filename}");
+        let buffer = open_buffer(&project, &full_path, cx).await;
+        cx.executor().run_until_parked();
+
+        (project, fs, buffer)
+    }
+
+    /// Triggers syntactic bookmark resolution by calling `bookmarks_for_buffer`.
+    fn trigger_resolution(
+        project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        cx: &mut TestAppContext,
+    ) {
+        project.update(cx, |project, cx| {
+            let snapshot = buffer.read(cx).snapshot();
+            project.bookmark_store().update(cx, |store, cx| {
+                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
+            });
+        });
+    }
+
+    /// Computes the syntactic context (symbol_path, offset_in_symbol) for a row.
+    fn compute_syntactic_context(
+        buffer: &Entity<Buffer>,
+        row: u32,
+        cx: &mut TestAppContext,
+    ) -> (Option<Vec<String>>, Option<u32>) {
+        buffer.read_with(cx, |buffer, _cx| {
+            let snapshot = buffer.snapshot();
+            project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, row)
+        })
+    }
+
     #[gpui::test]
     async fn test_compute_syntactic_context_without_language(cx: &mut TestAppContext) {
         init_test(cx);
@@ -725,72 +775,34 @@ mod integration {
         // Deliberately do NOT register rust language
         let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
 
-        let bookmarks = project.read_with(cx, |project, cx| {
-            let buffer_entity = buffer.clone();
-            let snapshot = buffer_entity.read(cx).snapshot();
-            let bookmark_store = project.bookmark_store();
-            let all = bookmark_store.read(cx).all_serialized_bookmarks(cx);
-            // Manually check compute_syntactic_context
-            let (sym, offset) =
-                project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, 0);
-            (sym, offset, all)
-        });
+        let (symbol_path, offset) = compute_syntactic_context(&buffer, 0, cx);
 
-        // Without language registered, symbol_path should be None
         assert!(
-            bookmarks.0.is_none(),
+            symbol_path.is_none(),
             "Expected None symbol_path without language, got: {:?}",
-            bookmarks.0
+            symbol_path
         );
-        assert!(bookmarks.1.is_none());
+        assert!(offset.is_none());
     }
 
     #[gpui::test]
     async fn test_compute_syntactic_context_with_language(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
+        let (_project, _fs, buffer) =
+            setup_rust_project("fn hello() {\n    let x = 1;\n}\n", "file.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/project"),
-            json!({
-                "file.rs": "fn hello() {\n    let x = 1;\n}\n"
-            }),
-        )
-        .await;
+        let (symbol_path, offset_in_symbol) = compute_syntactic_context(&buffer, 1, cx);
 
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
-        // Allow tree-sitter to parse
-        cx.executor().run_until_parked();
-
-        let (symbol_path, offset_in_symbol) = project.read_with(cx, |_project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, 1)
-        });
-
-        assert!(
-            symbol_path.is_some(),
-            "Expected symbol_path with Rust language, got None. \
-             Is tree-sitter parsing active?"
-        );
-        let path = symbol_path.unwrap();
+        let path = symbol_path.expect("Expected symbol_path with Rust language");
         assert!(
             path.iter().any(|s| s.contains("hello")),
             "Expected symbol path to contain 'hello', got: {:?}",
             path
         );
-        // Row 1 is inside fn hello() which starts at row 0, so offset should be 1
         assert_eq!(offset_in_symbol, Some(1));
     }
 
     #[gpui::test]
     async fn test_compute_syntactic_context_nested_symbols(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
         let rust_source = "\
 struct Processor;\n\
 \n\
@@ -804,27 +816,12 @@ impl Processor {\n\
     }\n\
 }\n";
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"lib.rs": rust_source}))
-            .await;
-
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/lib.rs"), cx).await;
-        cx.executor().run_until_parked();
+        let (_project, _fs, buffer) = setup_rust_project(rust_source, "lib.rs", cx).await;
 
         // Row 4 is "let x = 1;" inside fn process inside impl Processor
-        let (symbol_path, offset) = project.read_with(cx, |_project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, 4)
-        });
+        let (symbol_path, offset) = compute_syntactic_context(&buffer, 4, cx);
 
-        assert!(
-            symbol_path.is_some(),
-            "Expected nested symbol path, got None"
-        );
-        let path = symbol_path.unwrap();
+        let path = symbol_path.expect("Expected nested symbol path");
         assert!(
             path.len() >= 2,
             "Expected at least 2 levels of nesting (impl + fn), got: {:?}",
@@ -845,22 +842,9 @@ impl Processor {\n\
 
     #[gpui::test]
     async fn test_serialized_bookmarks_include_syntactic_context(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
         let rust_source = "fn alpha() {\n    let a = 1;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": rust_source}))
-            .await;
-
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        // Add bookmark inside fn alpha (row 1) and fn beta (row 5)
         add_bookmarks(&project, &buffer, &[1, 5], cx);
 
         let bookmarks = get_all_bookmarks(&project, cx);
@@ -870,41 +854,33 @@ impl Processor {\n\
 
         assert_eq!(file_bookmarks.len(), 2);
 
-        // Check that serialized bookmarks have symbol_path populated
         let bookmark_alpha = &file_bookmarks[0];
         assert_eq!(bookmark_alpha.row, 1);
+        let alpha_path = bookmark_alpha
+            .symbol_path
+            .as_ref()
+            .expect("Bookmark at row 1 should have symbol_path");
         assert!(
-            bookmark_alpha.symbol_path.is_some(),
-            "Bookmark at row 1 should have symbol_path, got None"
+            alpha_path.iter().any(|s| s.contains("alpha")),
+            "Bookmark at row 1 should reference 'alpha', got: {:?}",
+            alpha_path
         );
-        if let Some(path) = &bookmark_alpha.symbol_path {
-            assert!(
-                path.iter().any(|s| s.contains("alpha")),
-                "Bookmark at row 1 should reference 'alpha', got: {:?}",
-                path
-            );
-        }
 
         let bookmark_beta = &file_bookmarks[1];
         assert_eq!(bookmark_beta.row, 5);
+        let beta_path = bookmark_beta
+            .symbol_path
+            .as_ref()
+            .expect("Bookmark at row 5 should have symbol_path");
         assert!(
-            bookmark_beta.symbol_path.is_some(),
-            "Bookmark at row 5 should have symbol_path, got None"
+            beta_path.iter().any(|s| s.contains("beta")),
+            "Bookmark at row 5 should reference 'beta', got: {:?}",
+            beta_path
         );
-        if let Some(path) = &bookmark_beta.symbol_path {
-            assert!(
-                path.iter().any(|s| s.contains("beta")),
-                "Bookmark at row 5 should reference 'beta', got: {:?}",
-                path
-            );
-        }
     }
 
     #[gpui::test]
     async fn test_syntactic_resolve_after_lines_inserted(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
         // Original source: fn target starts at row 4
         let original = "\
 fn preamble() {\n\
@@ -915,72 +891,40 @@ fn target() {\n\
     let b = 2;\n\
 }\n";
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": original}))
-            .await;
-
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
+        let (project, _fs, buffer) = setup_rust_project(original, "main.rs", cx).await;
 
         // Bookmark on row 5 ("let b = 2;") inside fn target
         add_bookmarks(&project, &buffer, &[5], cx);
 
-        // Serialize (captures syntactic context for fn target)
         let serialized = get_all_bookmarks(&project, cx);
         let file_bookmarks = serialized
             .get(&project_path(path!("/project/main.rs")))
             .expect("Expected bookmarks");
         assert_eq!(file_bookmarks.len(), 1);
         assert_eq!(file_bookmarks[0].row, 5);
-
-        // Verify symbol_path was captured
         assert!(
             file_bookmarks[0].symbol_path.is_some(),
-            "Expected symbol_path for bookmark inside fn target, got None. \
-             This means compute_syntactic_context returned no symbols. \
-             Possible causes: language not registered, tree-sitter not parsed."
+            "Expected symbol_path for bookmark inside fn target"
         );
 
-        // Now clear and restore with modified file where 3 blank lines
-        // were inserted at the top, shifting fn target from row 4 to row 7
+        // Insert 3 blank lines at top, shifting fn target from row 4 to row 7
         clear_bookmarks(&project, cx);
-
-        // Modify the buffer to insert lines at the beginning
         buffer.update(cx, |buffer, cx| {
             buffer.edit([(0..0, "\n\n\n")], None, cx);
         });
         cx.executor().run_until_parked();
 
-        // Restore bookmarks with original serialized data
-        // (row=5, but fn target has moved to row 7, "let b = 2;" is now row 8)
+        // Restore with original serialized data and resolve
         restore_bookmarks(&project, serialized, cx).await;
-
-        // Trigger resolution by querying bookmarks
-        project.update(cx, |project, cx| {
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &buffer_snapshot, cx);
-            });
-        });
+        trigger_resolution(&project, &buffer, cx);
 
         let restored = get_all_bookmarks(&project, cx);
         let restored_bookmarks = restored
             .get(&project_path(path!("/project/main.rs")))
             .expect("Expected restored bookmarks");
         assert_eq!(restored_bookmarks.len(), 1);
-
-        // The bookmark should have been resolved to the new location of
-        // "let b = 2;" inside fn target, which is now at row 8 (target starts at row 7, offset 1)
-        let restored_row = restored_bookmarks[0].row;
-        assert_ne!(
-            restored_row, 5,
-            "Bookmark should NOT be at original row 5 after lines were inserted"
-        );
         assert_eq!(
-            restored_row, 8,
+            restored_bookmarks[0].row, 8,
             "Bookmark should be at row 8 (fn target moved to row 7, offset 1)"
         );
     }
@@ -998,19 +942,12 @@ fn target() {\n\
         .await;
 
         let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        // No language registered — bookmarks will have no syntactic context
 
-        // Restore with a plain row-only bookmark
         let serialized = build_serialized(&[(path!("/project/file.txt"), &[2])]);
         restore_bookmarks(&project, serialized, cx).await;
 
         let buffer = open_buffer(&project, path!("/project/file.txt"), cx).await;
-        project.update(cx, |project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
-            });
-        });
+        trigger_resolution(&project, &buffer, cx);
 
         let restored = get_all_bookmarks(&project, cx);
         assert_bookmark_rows(&restored, path!("/project/file.txt"), &[2]);
@@ -1020,36 +957,16 @@ fn target() {\n\
     async fn test_syntactic_resolve_with_symbol_path_and_no_match_falls_back(
         cx: &mut TestAppContext,
     ) {
-        init_test(cx);
-        cx.executor().allow_parking();
+        let (project, _fs, buffer) =
+            setup_rust_project("fn hello() {\n    let x = 1;\n}\n", "main.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        // The file has fn hello but the bookmark references fn nonexistent
-        fs.insert_tree(
-            path!("/project"),
-            json!({"main.rs": "fn hello() {\n    let x = 1;\n}\n"}),
-        )
-        .await;
-
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        // Serialize with a symbol_path that won't be found
+        // Restore with a symbol_path that won't be found in the file
         let serialized = build_syntactic_serialized(&[(
             path!("/project/main.rs"),
             &[(1, Some(vec!["fn nonexistent"]), Some(1))],
         )]);
         restore_bookmarks(&project, serialized, cx).await;
-
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        project.update(cx, |project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
-            });
-        });
+        trigger_resolution(&project, &buffer, cx);
 
         // Should fall back to row 1
         let restored = get_all_bookmarks(&project, cx);
@@ -1058,33 +975,15 @@ fn target() {\n\
 
     #[gpui::test]
     async fn test_syntactic_resolve_with_matching_symbol_path(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
         let rust_source = "fn first() {\n    let a = 1;\n}\n\nfn second() {\n    let b = 2;\n}\n";
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": rust_source}))
-            .await;
+        let (second_symbol_path, _) = compute_syntactic_context(&buffer, 5, cx);
+        let second_symbol_text =
+            second_symbol_path.expect("fn second should produce a symbol path");
 
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        // First, figure out what symbol text looks like for fn second
-        let second_symbol_text = project.read_with(cx, |_project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            let (path, _) =
-                project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, 5);
-            path.expect("fn second should produce a symbol path")
-        });
-
-        // Now create a serialized bookmark using the exact symbol text,
-        // but with a WRONG row (row 0 instead of row 5).
-        // If syntactic resolution works, it should resolve to inside fn second,
-        // not fall back to row 0.
+        // Create serialized bookmark with the correct symbol text but a WRONG
+        // fallback row (0 instead of 5). Syntactic resolution should override it.
         let serialized = build_syntactic_serialized(&[(
             path!("/project/main.rs"),
             &[(
@@ -1096,59 +995,21 @@ fn target() {\n\
 
         clear_bookmarks(&project, cx);
         restore_bookmarks(&project, serialized, cx).await;
-
-        project.update(cx, |project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
-            });
-        });
+        trigger_resolution(&project, &buffer, cx);
 
         let restored = get_all_bookmarks(&project, cx);
-        let file_bookmarks = restored
-            .get(&project_path(path!("/project/main.rs")))
-            .expect("Expected bookmarks");
-        assert_eq!(file_bookmarks.len(), 1);
-
-        // Should resolve to fn second's body (row 4 + offset 1 = row 5),
-        // NOT the fallback row 0
-        assert_ne!(
-            file_bookmarks[0].row, 0,
-            "Syntactic resolution should override the fallback row"
-        );
-        assert_eq!(
-            file_bookmarks[0].row, 5,
-            "Should resolve to row 5 (fn second start + offset 1)"
-        );
+        assert_bookmark_rows(&restored, path!("/project/main.rs"), &[5]);
     }
 
     #[gpui::test]
     async fn test_serialized_bookmark_round_trip_preserves_symbol_path(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
+        let (project, _fs, buffer) =
+            setup_rust_project("fn greet() {\n    println!(\"hi\");\n}\n", "main.rs", cx).await;
 
-        let rust_source = "fn greet() {\n    println!(\"hi\");\n}\n";
-
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": rust_source}))
-            .await;
-
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        // Add bookmark inside fn greet
         add_bookmarks(&project, &buffer, &[1], cx);
 
-        // Serialize
         let serialized = get_all_bookmarks(&project, cx);
-        let file_bookmarks = &serialized[&project_path(path!("/project/main.rs"))];
-        assert_eq!(file_bookmarks.len(), 1);
-        let original = file_bookmarks[0].clone();
-
-        // Verify syntactic info
+        let original = serialized[&project_path(path!("/project/main.rs"))][0].clone();
         assert!(original.symbol_path.is_some(), "Should have symbol_path");
         assert!(
             original.offset_in_symbol.is_some(),
@@ -1158,75 +1019,31 @@ fn target() {\n\
         // Clear, restore, resolve, re-serialize
         clear_bookmarks(&project, cx);
         restore_bookmarks(&project, serialized, cx).await;
+        trigger_resolution(&project, &buffer, cx);
 
-        // Trigger resolution
-        project.update(cx, |project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
-            });
-        });
-
-        // Re-serialize and compare
         let re_serialized = get_all_bookmarks(&project, cx);
-        let re_file_bookmarks = &re_serialized[&project_path(path!("/project/main.rs"))];
-        assert_eq!(re_file_bookmarks.len(), 1);
-
-        assert_eq!(
-            re_file_bookmarks[0].row, original.row,
-            "Row should survive round trip"
-        );
-        assert_eq!(
-            re_file_bookmarks[0].symbol_path, original.symbol_path,
-            "Symbol path should survive round trip"
-        );
-        assert_eq!(
-            re_file_bookmarks[0].offset_in_symbol, original.offset_in_symbol,
-            "Offset in symbol should survive round trip"
-        );
+        let round_tripped = &re_serialized[&project_path(path!("/project/main.rs"))][0];
+        assert_eq!(round_tripped.row, original.row);
+        assert_eq!(round_tripped.symbol_path, original.symbol_path);
+        assert_eq!(round_tripped.offset_in_symbol, original.offset_in_symbol);
     }
 
     #[gpui::test]
     async fn test_syntactic_resolve_deferred_until_reparse(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
-        // Two functions so the bookmark can move to a non-trivial position.
-        // fn preamble occupies rows 0-2, fn target occupies rows 4-6.
         let rust_source =
             "fn preamble() {\n    let a = 0;\n}\n\nfn target() {\n    let x = 1;\n}\n";
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": rust_source}))
-            .await;
+        let (target_path, _) = compute_syntactic_context(&buffer, 5, cx);
+        let target_symbol_text = target_path.expect("fn target should produce a symbol path");
+        assert!(
+            target_symbol_text.iter().any(|s| s.contains("target")),
+            "Expected symbol path containing 'target', got: {:?}",
+            target_symbol_text
+        );
 
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        // First, open the buffer and let tree-sitter parse so we can learn
-        // the exact symbol text that the outline query produces.
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        let target_symbol_text = project.read_with(cx, |_project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            let (path, _) =
-                project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, 5);
-            let path = path.expect("fn target should produce a symbol path");
-            assert!(
-                path.iter().any(|s| s.contains("target")),
-                "Expected symbol path containing 'target', got: {:?}",
-                path
-            );
-            path
-        });
-
-        // Now simulate a session restore: clear everything, restore serialized
-        // bookmarks, then re-open the buffer.
+        // Restore with wrong fallback row (0); symbol path should resolve to row 5.
         clear_bookmarks(&project, cx);
-
-        // Build serialized data: fallback row is 0 (wrong on purpose),
-        // but the symbol path points to fn target with offset 1.
         let serialized = build_syntactic_serialized(&[(
             path!("/project/main.rs"),
             &[(
@@ -1236,67 +1053,23 @@ fn target() {\n\
             )],
         )]);
         restore_bookmarks(&project, serialized, cx).await;
-
-        // Trigger resolution by querying bookmarks_for_buffer.
-        // At this point the buffer IS parsed (from our earlier run_until_parked),
-        // so the outline should be available and resolution should work immediately.
-        project.update(cx, |project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
-            });
-        });
+        trigger_resolution(&project, &buffer, cx);
 
         let after = get_all_bookmarks(&project, cx);
-        let bookmarks = after
-            .get(&project_path(path!("/project/main.rs")))
-            .expect("Expected bookmarks");
-        assert_eq!(bookmarks.len(), 1);
-
-        // fn target starts at row 4, offset 1 = row 5
-        assert_ne!(
-            bookmarks[0].row, 0,
-            "Bookmark should NOT remain at fallback row 0"
-        );
-        assert_eq!(
-            bookmarks[0].row, 5,
-            "Bookmark should resolve to row 5 (fn target at row 4 + offset 1)"
-        );
+        assert_bookmark_rows(&after, path!("/project/main.rs"), &[5]);
     }
 
     #[gpui::test]
     async fn test_syntactic_resolve_deferred_via_reparse_event(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
         let rust_source =
             "fn preamble() {\n    let a = 0;\n}\n\nfn target() {\n    let x = 1;\n}\n";
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": rust_source}))
-            .await;
+        let (target_path, _) = compute_syntactic_context(&buffer, 5, cx);
+        let target_symbol_text = target_path.expect("fn target should have symbol path");
 
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        // Learn the real symbol text by parsing first
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        let target_symbol_text = project.read_with(cx, |_project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            let (path, _) =
-                project::bookmark_store::BookmarkStore::compute_syntactic_context(&snapshot, 5);
-            path.expect("fn target should have symbol path")
-        });
-
-        // Drop the buffer so we can simulate a fresh open.
-        // Actually, we can't easily drop a buffer from the store, so instead
-        // let's clear bookmarks, restore with syntactic data, then trigger
-        // an edit (which causes reparse) to exercise the Reparsed handler.
+        // Restore with wrong fallback row and resolve immediately
         clear_bookmarks(&project, cx);
-
-        // Restore with wrong fallback row
         let serialized = build_syntactic_serialized(&[(
             path!("/project/main.rs"),
             &[(
@@ -1306,65 +1079,33 @@ fn target() {\n\
             )],
         )]);
         restore_bookmarks(&project, serialized, cx).await;
+        trigger_resolution(&project, &buffer, cx);
 
-        // Trigger resolution — the buffer already has an outline from the
-        // previous parse, so the pending_syntactic path won't be exercised
-        // in this case. Instead this tests the immediate resolution path.
-        project.update(cx, |project, cx| {
-            let snapshot = buffer.read(cx).snapshot();
-            project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
-            });
-        });
-
-        let result = get_all_bookmarks(&project, cx);
-        let bookmarks = result
-            .get(&project_path(path!("/project/main.rs")))
-            .expect("Expected bookmarks");
-        assert_eq!(bookmarks.len(), 1);
-        assert_eq!(
-            bookmarks[0].row, 5,
-            "Bookmark should resolve to row 5 via immediate syntactic resolution"
+        assert_bookmark_rows(
+            &get_all_bookmarks(&project, cx),
+            path!("/project/main.rs"),
+            &[5],
         );
 
-        // Now verify the Reparsed event path works by editing and checking
-        // that bookmarks are still correctly placed after reparse.
+        // Verify the Reparsed event path: edit shifts bookmark row 5 -> 6
         buffer.update(cx, |buffer, cx| {
             buffer.edit([(0..0, "// comment\n")], None, cx);
         });
         cx.executor().run_until_parked();
 
-        let after_edit = get_all_bookmarks(&project, cx);
-        let after_edit_bookmarks = after_edit
-            .get(&project_path(path!("/project/main.rs")))
-            .expect("Expected bookmarks after edit");
-        assert_eq!(after_edit_bookmarks.len(), 1);
-        // The bookmark anchor should have shifted with the edit (row 5 -> row 6)
-        assert_eq!(
-            after_edit_bookmarks[0].row, 6,
-            "After inserting a line, bookmark should shift to row 6"
+        assert_bookmark_rows(
+            &get_all_bookmarks(&project, cx),
+            path!("/project/main.rs"),
+            &[6],
         );
     }
 
     #[gpui::test]
     async fn test_bookmark_outside_any_symbol_has_no_syntactic_context(cx: &mut TestAppContext) {
-        init_test(cx);
-        cx.executor().allow_parking();
-
         // Row 3 is a blank line between two functions
-        let rust_source = "fn first() {\n}\n\n\nfn second() {\n}\n";
+        let (project, _fs, buffer) =
+            setup_rust_project("fn first() {\n}\n\n\nfn second() {\n}\n", "main.rs", cx).await;
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": rust_source}))
-            .await;
-
-        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
-        register_rust_language(&project, cx);
-
-        let buffer = open_buffer(&project, path!("/project/main.rs"), cx).await;
-        cx.executor().run_until_parked();
-
-        // Row 3 is blank, outside any function
         add_bookmarks(&project, &buffer, &[3], cx);
 
         let bookmarks = get_all_bookmarks(&project, cx);
