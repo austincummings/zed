@@ -12,6 +12,19 @@ use text::{Anchor, BufferSnapshot, Point, ToPoint};
 
 use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
 
+#[derive(Debug)]
+pub struct BookmarkFingerprint {
+    pub line_snippet: String,
+    pub context_lines: String,
+    pub last_known_row: u32,
+}
+
+#[derive(Debug)]
+pub struct TrackedBookmark {
+    pub anchor: BookmarkAnchor,
+    pub fingerprint: BookmarkFingerprint,
+}
+
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BookmarkAnchor(text::Anchor);
 
@@ -250,7 +263,12 @@ impl BookmarkStore {
                         } else {
                             item_start_row
                         };
-                        Self::compute_context_snippet(snapshot, candidate_row).as_deref()
+                        Self::compute_line_snippet(
+                            snapshot,
+                            candidate_row,
+                            Self::CONTEXT_SNIPPET_MAX_LEN,
+                        )
+                        .as_deref()
                             == Some(snippet)
                     })
                     .or(full_matches.first())
@@ -417,9 +435,10 @@ impl BookmarkStore {
     /// Extract the first 30 characters of text at the given row, trimmed of
     /// leading/trailing whitespace. Used to disambiguate bookmarks in duplicate
     /// outline sections that share the same symbol path.
-    pub fn compute_context_snippet(
+    pub fn compute_line_snippet(
         snapshot: &language::BufferSnapshot,
         row: u32,
+        len: usize,
     ) -> Option<String> {
         let max_row = snapshot.max_point().row;
         if row > max_row {
@@ -432,10 +451,7 @@ impl BookmarkStore {
         if trimmed.is_empty() {
             return None;
         }
-        let clipped: String = trimmed
-            .chars()
-            .take(Self::CONTEXT_SNIPPET_MAX_LEN)
-            .collect();
+        let clipped: String = trimmed.chars().take(len).collect();
         Some(clipped)
     }
 
@@ -665,7 +681,11 @@ impl BookmarkStore {
                                     snapshot.summary_for_anchor::<Point>(&bookmark.anchor()).row;
                                 let (symbol_path, offset_in_symbol) =
                                     Self::compute_syntactic_context(&snapshot, row);
-                                let context_snippet = Self::compute_context_snippet(&snapshot, row);
+                                let context_snippet = Self::compute_line_snippet(
+                                    &snapshot,
+                                    row,
+                                    Self::CONTEXT_SNIPPET_MAX_LEN,
+                                );
                                 Some(SerializedBookmark {
                                     row,
                                     symbol_path,
@@ -715,5 +735,85 @@ impl BookmarkStore {
     pub fn clear_bookmarks(&mut self, cx: &mut Context<Self>) {
         self.bookmarks.clear();
         cx.notify();
+    }
+
+    const FINGERPRINT_LINE_LEN: usize = 60;
+    const FINGERPRINT_CONTEXT_LINES: usize = 2;
+
+    pub fn compute_fingerprint(
+        &self,
+        snapshot: &language::BufferSnapshot,
+        row: u32,
+    ) -> BookmarkFingerprint {
+        let max_row = snapshot.max_point().row;
+
+        let line_snippet = Self::compute_line_snippet(snapshot, row, Self::FINGERPRINT_LINE_LEN)
+            .unwrap_or_default();
+
+        let context_start = row.saturating_sub(Self::FINGERPRINT_CONTEXT_LINES as u32);
+        let context_end = (row + Self::FINGERPRINT_CONTEXT_LINES as u32).min(max_row);
+        let mut context_parts = Vec::new();
+        for r in context_start..=context_end {
+            if r == row {
+                continue;
+            }
+            let line_start = Point::new(r, 0);
+            let line_end = Point::new(r, snapshot.line_len(r));
+            let text: String = snapshot.text_for_range(line_start..line_end).collect();
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                context_parts.push(trimmed);
+            }
+        }
+
+        BookmarkFingerprint {
+            line_snippet,
+            context_lines: context_parts.join("\n"),
+            last_known_row: row,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Project;
+
+    use super::*;
+
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use util::path;
+
+    #[gpui::test]
+    async fn test_compute_fingerprint(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        cx.executor().allow_parking();
+
+        let filename = "target.rs";
+        let rust_source =
+            "fn preamble() {\n    let a = 0;\n}\n\nfn target() {\n    let x = 1;\n}\n";
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ filename: rust_source }))
+            .await;
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+
+        let full_path = format!("/project/{filename}");
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(Path::new(full_path), cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+
+        // Open buffer
     }
 }
