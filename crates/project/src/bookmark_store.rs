@@ -39,6 +39,9 @@ pub struct SerializedBookmark {
 pub struct BufferBookmarks {
     buffer: Entity<Buffer>,
     bookmarks: Vec<BookmarkAnchor>,
+    /// Serialized bookmarks with syntactic context waiting for tree-sitter
+    /// to finish parsing so that outline-based resolution can be attempted.
+    pending_syntactic: Vec<SerializedBookmark>,
     _subscription: Subscription,
 }
 
@@ -50,6 +53,9 @@ impl BufferBookmarks {
                 BufferEvent::FileHandleChanged => {
                     bookmark_store.handle_file_changed(buffer, cx);
                 }
+                BufferEvent::Reparsed => {
+                    bookmark_store.resolve_pending_syntactic_bookmarks(buffer, cx);
+                }
                 _ => {}
             },
         );
@@ -57,6 +63,7 @@ impl BufferBookmarks {
         Self {
             buffer,
             bookmarks: Vec::new(),
+            pending_syntactic: Vec::new(),
             _subscription: subscription,
         }
     }
@@ -140,18 +147,33 @@ impl BookmarkStore {
         let outline = snapshot.outline(None);
         let outline_items: &[OutlineItem<Anchor>] = &outline.items;
 
+        let has_syntactic_bookmarks = serialized
+            .iter()
+            .any(|b| b.symbol_path.as_ref().is_some_and(|p| !p.is_empty()));
+        let outline_is_empty = outline_items.is_empty();
+
+        // Collect bookmarks that have syntactic context but can't be resolved
+        // yet because the outline is empty (tree-sitter hasn't parsed yet).
+        let mut pending_syntactic = Vec::new();
+
         let anchors: Vec<BookmarkAnchor> = serialized
             .iter()
             .filter_map(|bookmark| {
-                if let Some(resolved_row) =
-                    Self::resolve_syntactic_bookmark(bookmark, outline_items, &snapshot)
-                {
-                    let point = Point::new(resolved_row, 0);
-                    if point > max_point {
-                        return None;
+                if !outline_is_empty {
+                    if let Some(resolved_row) =
+                        Self::resolve_syntactic_bookmark(bookmark, outline_items, &snapshot)
+                    {
+                        let point = Point::new(resolved_row, 0);
+                        if point > max_point {
+                            return None;
+                        }
+                        let anchor = snapshot.anchor_after(point);
+                        return Some(BookmarkAnchor(anchor));
                     }
-                    let anchor = snapshot.anchor_after(point);
-                    return Some(BookmarkAnchor(anchor));
+                } else if bookmark.symbol_path.as_ref().is_some_and(|p| !p.is_empty()) {
+                    // Outline not available yet; save for deferred resolution
+                    // after tree-sitter parses.
+                    pending_syntactic.push(bookmark.clone());
                 }
 
                 let point = Point::new(bookmark.row, 0);
@@ -170,11 +192,14 @@ impl BookmarkStore {
             })
             .collect();
 
-        if anchors.is_empty() {
+        if anchors.is_empty() && pending_syntactic.is_empty() {
             self.bookmarks.remove(abs_path);
         } else {
             let mut buffer_bookmarks = BufferBookmarks::new(buffer.clone(), cx);
             buffer_bookmarks.bookmarks = anchors;
+            if has_syntactic_bookmarks && outline_is_empty {
+                buffer_bookmarks.pending_syntactic = pending_syntactic;
+            }
             self.bookmarks
                 .insert(abs_path.clone(), BookmarkEntry::Loaded(buffer_bookmarks));
         }
@@ -384,7 +409,7 @@ impl BookmarkStore {
             unreachable!("resolve_if_needed should have converted to Loaded");
         };
 
-        let snapshot = buffer.read(cx).text_snapshot();
+        let snapshot = buffer.read(cx).snapshot();
 
         let existing_index = buffer_bookmarks.bookmarks.iter().position(|existing| {
             existing.0.summary::<Point>(&snapshot).row == anchor.summary::<Point>(&snapshot).row
@@ -493,6 +518,75 @@ impl BookmarkStore {
                 cx.notify();
             }
         }
+    }
+
+    /// Called when a buffer finishes tree-sitter parsing. Re-resolves any
+    /// bookmarks that were placed at fallback row positions because the outline
+    /// was not yet available.
+    fn resolve_pending_syntactic_bookmarks(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
+            return;
+        };
+
+        let Some(BookmarkEntry::Loaded(buffer_bookmarks)) = self.bookmarks.get_mut(&abs_path)
+        else {
+            return;
+        };
+
+        if buffer_bookmarks.pending_syntactic.is_empty() {
+            return;
+        }
+
+        let pending = std::mem::take(&mut buffer_bookmarks.pending_syntactic);
+
+        let snapshot = buffer.read(cx).snapshot();
+        let max_point = snapshot.max_point();
+        let outline = snapshot.outline(None);
+        let outline_items: &[OutlineItem<Anchor>] = &outline.items;
+
+        if outline_items.is_empty() {
+            // Still no outline — put them back for the next reparse.
+            if let Some(BookmarkEntry::Loaded(bm)) = self.bookmarks.get_mut(&abs_path) {
+                bm.pending_syntactic = pending;
+            }
+            return;
+        }
+
+        let text_snapshot = buffer.read(cx).text_snapshot();
+
+        for serialized in &pending {
+            let Some(resolved_row) =
+                Self::resolve_syntactic_bookmark(serialized, outline_items, &snapshot)
+            else {
+                continue;
+            };
+
+            let point = Point::new(resolved_row, 0);
+            if point > max_point {
+                continue;
+            }
+
+            // Find the existing bookmark that was placed at the fallback row
+            // and move it to the syntactically-resolved position.
+            let fallback_row = serialized.row;
+            let new_anchor = snapshot.anchor_after(point);
+
+            if let Some(BookmarkEntry::Loaded(bm)) = self.bookmarks.get_mut(&abs_path) {
+                if let Some(existing) = bm
+                    .bookmarks
+                    .iter_mut()
+                    .find(|b| b.0.summary::<Point>(&text_snapshot).row == fallback_row)
+                {
+                    *existing = BookmarkAnchor(new_anchor);
+                }
+            }
+        }
+
+        cx.notify();
     }
 
     pub fn all_serialized_bookmarks(

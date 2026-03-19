@@ -407,12 +407,26 @@ impl Column for Bookmark {
             .with_context(|| format!("Failed to read bookmark row at index {start_index}"))?
             as u32;
 
-        let symbol_path = statement
-            .column_text(start_index + 1)
-            .ok()
-            .map(|s| s.to_string());
+        let symbol_path = if matches!(
+            statement.column_type(start_index + 1),
+            Ok(db::sqlez::statement::SqlType::Null)
+        ) {
+            None
+        } else {
+            statement
+                .column_text(start_index + 1)
+                .ok()
+                .map(|s| s.to_string())
+        };
 
-        let offset_in_symbol = statement.column_int(start_index + 2).ok().map(|v| v as u32);
+        let offset_in_symbol = if matches!(
+            statement.column_type(start_index + 2),
+            Ok(db::sqlez::statement::SqlType::Null)
+        ) {
+            None
+        } else {
+            statement.column_int(start_index + 2).ok().map(|v| v as u32)
+        };
 
         Ok((
             Bookmark {
@@ -4630,5 +4644,225 @@ mod tests {
             "flush_serialization should ensure window bounds are persisted to the DB \
              before the process exits."
         );
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_db_round_trip_without_syntactic_context() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_bookmarks_plain").await;
+        let id = db.next_id().await.unwrap();
+
+        let workspace = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            location: SerializedWorkspaceLocation::Local,
+            center_group: Default::default(),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: {
+                let mut map = collections::BTreeMap::default();
+                map.insert(
+                    Arc::from(Path::new("/tmp/main.rs")),
+                    vec![
+                        SerializedBookmark {
+                            row: 5,
+                            symbol_path: None,
+                            offset_in_symbol: None,
+                        },
+                        SerializedBookmark {
+                            row: 10,
+                            symbol_path: None,
+                            offset_in_symbol: None,
+                        },
+                    ],
+                );
+                map
+            },
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+
+        db.save_workspace(workspace).await;
+
+        let loaded = db.workspace_for_roots::<&str>(&["/tmp"]).unwrap();
+        let loaded_bookmarks = loaded
+            .bookmarks
+            .get(&Arc::from(Path::new("/tmp/main.rs")))
+            .expect("Expected bookmarks for /tmp/main.rs");
+
+        assert_eq!(loaded_bookmarks.len(), 2);
+        assert_eq!(loaded_bookmarks[0].row, 5);
+        assert!(loaded_bookmarks[0].symbol_path.is_none());
+        assert!(loaded_bookmarks[0].offset_in_symbol.is_none());
+        assert_eq!(loaded_bookmarks[1].row, 10);
+        assert!(loaded_bookmarks[1].symbol_path.is_none());
+        assert!(loaded_bookmarks[1].offset_in_symbol.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_db_round_trip_with_syntactic_context() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_bookmarks_syntactic").await;
+        let id = db.next_id().await.unwrap();
+
+        let workspace = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            location: SerializedWorkspaceLocation::Local,
+            center_group: Default::default(),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: {
+                let mut map = collections::BTreeMap::default();
+                map.insert(
+                    Arc::from(Path::new("/tmp/lib.rs")),
+                    vec![
+                        SerializedBookmark {
+                            row: 3,
+                            symbol_path: Some(vec![
+                                "impl Processor".to_string(),
+                                "fn process".to_string(),
+                            ]),
+                            offset_in_symbol: Some(1),
+                        },
+                        SerializedBookmark {
+                            row: 15,
+                            symbol_path: Some(vec!["fn standalone".to_string()]),
+                            offset_in_symbol: Some(0),
+                        },
+                        SerializedBookmark {
+                            row: 20,
+                            symbol_path: None,
+                            offset_in_symbol: None,
+                        },
+                    ],
+                );
+                map
+            },
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+
+        db.save_workspace(workspace).await;
+
+        let loaded = db.workspace_for_roots::<&str>(&["/tmp"]).unwrap();
+        let loaded_bookmarks = loaded
+            .bookmarks
+            .get(&Arc::from(Path::new("/tmp/lib.rs")))
+            .expect("Expected bookmarks for /tmp/lib.rs");
+
+        assert_eq!(loaded_bookmarks.len(), 3);
+
+        // First bookmark: has nested symbol_path
+        assert_eq!(loaded_bookmarks[0].row, 3);
+        assert_eq!(
+            loaded_bookmarks[0].symbol_path,
+            Some(vec!["impl Processor".to_string(), "fn process".to_string()])
+        );
+        assert_eq!(loaded_bookmarks[0].offset_in_symbol, Some(1));
+
+        // Second bookmark: has single-level symbol_path
+        assert_eq!(loaded_bookmarks[1].row, 15);
+        assert_eq!(
+            loaded_bookmarks[1].symbol_path,
+            Some(vec!["fn standalone".to_string()])
+        );
+        assert_eq!(loaded_bookmarks[1].offset_in_symbol, Some(0));
+
+        // Third bookmark: no syntactic context
+        assert_eq!(loaded_bookmarks[2].row, 20);
+        assert!(loaded_bookmarks[2].symbol_path.is_none());
+        assert!(loaded_bookmarks[2].offset_in_symbol.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_db_overwrite_preserves_syntactic_context() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_bookmarks_overwrite").await;
+        let id = db.next_id().await.unwrap();
+
+        // First save: one bookmark without syntactic context
+        let workspace_v1 = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            location: SerializedWorkspaceLocation::Local,
+            center_group: Default::default(),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: {
+                let mut map = collections::BTreeMap::default();
+                map.insert(
+                    Arc::from(Path::new("/tmp/main.rs")),
+                    vec![SerializedBookmark {
+                        row: 5,
+                        symbol_path: None,
+                        offset_in_symbol: None,
+                    }],
+                );
+                map
+            },
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+        db.save_workspace(workspace_v1).await;
+
+        // Second save: replace with syntactic bookmark
+        let workspace_v2 = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            location: SerializedWorkspaceLocation::Local,
+            center_group: Default::default(),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: {
+                let mut map = collections::BTreeMap::default();
+                map.insert(
+                    Arc::from(Path::new("/tmp/main.rs")),
+                    vec![SerializedBookmark {
+                        row: 8,
+                        symbol_path: Some(vec!["fn updated".to_string()]),
+                        offset_in_symbol: Some(2),
+                    }],
+                );
+                map
+            },
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+        db.save_workspace(workspace_v2).await;
+
+        let loaded = db.workspace_for_roots::<&str>(&["/tmp"]).unwrap();
+        let loaded_bookmarks = loaded
+            .bookmarks
+            .get(&Arc::from(Path::new("/tmp/main.rs")))
+            .expect("Expected bookmarks");
+
+        // Should only have the v2 bookmark
+        assert_eq!(loaded_bookmarks.len(), 1);
+        assert_eq!(loaded_bookmarks[0].row, 8);
+        assert_eq!(
+            loaded_bookmarks[0].symbol_path,
+            Some(vec!["fn updated".to_string()])
+        );
+        assert_eq!(loaded_bookmarks[0].offset_in_symbol, Some(2));
     }
 }
