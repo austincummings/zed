@@ -81,6 +81,7 @@ mod integration {
                         row,
                         symbol_path: None,
                         offset_in_symbol: None,
+                        context_snippet: None,
                     })
                     .collect(),
             );
@@ -694,6 +695,7 @@ mod integration {
                             .as_ref()
                             .map(|v| v.iter().map(|s| s.to_string()).collect()),
                         offset_in_symbol: *offset,
+                        context_snippet: None,
                     })
                     .collect(),
             );
@@ -1116,6 +1118,196 @@ fn target() {\n\
             file_bookmarks[0].symbol_path.is_none(),
             "Bookmark on blank line should have no symbol_path, got: {:?}",
             file_bookmarks[0].symbol_path
+        );
+    }
+
+    #[gpui::test]
+    async fn test_serialized_bookmarks_include_context_snippet(cx: &mut TestAppContext) {
+        let rust_source = "fn alpha() {\n    let a = 1;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
+
+        // Row 1 = "    let a = 1;" inside fn alpha
+        // Row 5 = "    let b = 2;" inside fn beta
+        add_bookmarks(&project, &buffer, &[1, 5], cx);
+
+        let bookmarks = get_all_bookmarks(&project, cx);
+        let file_bookmarks = bookmarks
+            .get(&project_path(path!("/project/main.rs")))
+            .expect("Expected bookmarks for main.rs");
+        assert_eq!(file_bookmarks.len(), 2);
+
+        let snippet_a = file_bookmarks[0]
+            .context_snippet
+            .as_ref()
+            .expect("Bookmark at row 1 should have a context_snippet");
+        assert!(
+            snippet_a.contains("let a"),
+            "Expected snippet to contain 'let a', got: {:?}",
+            snippet_a
+        );
+        assert!(
+            snippet_a.len() <= 30,
+            "Snippet should be at most 30 characters, got {} chars",
+            snippet_a.len()
+        );
+
+        let snippet_b = file_bookmarks[1]
+            .context_snippet
+            .as_ref()
+            .expect("Bookmark at row 5 should have a context_snippet");
+        assert!(
+            snippet_b.contains("let b"),
+            "Expected snippet to contain 'let b', got: {:?}",
+            snippet_b
+        );
+        assert!(
+            snippet_b.len() <= 30,
+            "Snippet should be at most 30 characters, got {} chars",
+            snippet_b.len()
+        );
+    }
+
+    fn build_syntactic_serialized_with_snippets(
+        entries: &[(&str, &[(u32, Option<Vec<&str>>, Option<u32>, Option<&str>)])],
+    ) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
+        let mut map = BTreeMap::new();
+        for (path_str, bookmarks) in entries {
+            let path = project_path(path_str);
+            map.insert(
+                path,
+                bookmarks
+                    .iter()
+                    .map(|(row, sym, offset, snippet)| SerializedBookmark {
+                        row: *row,
+                        symbol_path: sym
+                            .as_ref()
+                            .map(|v| v.iter().map(|s| s.to_string()).collect()),
+                        offset_in_symbol: *offset,
+                        context_snippet: snippet.map(|s| s.to_string()),
+                    })
+                    .collect(),
+            );
+        }
+        map
+    }
+
+    #[gpui::test]
+    async fn test_context_snippet_disambiguates_duplicate_symbol_paths(cx: &mut TestAppContext) {
+        // Two `fn process()` definitions in the same file via #[cfg] attributes.
+        // Tree-sitter produces outline items for both, each with text "fn process".
+        let rust_source = "\
+#[cfg(feature = \"a\")]\n\
+fn process() {\n\
+    let config_a = true;\n\
+}\n\
+\n\
+#[cfg(feature = \"b\")]\n\
+fn process() {\n\
+    let config_b = true;\n\
+}\n";
+
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
+
+        // Verify both fn process appear in the outline with the same text
+        let outline_items = buffer.read_with(cx, |buffer, _cx| {
+            let snapshot = buffer.snapshot();
+            let outline = snapshot.outline(None);
+            outline.items
+        });
+        let process_items: Vec<_> = outline_items
+            .iter()
+            .filter(|item| item.text.contains("process"))
+            .collect();
+        assert!(
+            process_items.len() >= 2,
+            "Expected at least 2 'process' outline items, got {}: {:?}",
+            process_items.len(),
+            process_items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
+
+        // Get the outline text used for both (they should be identical)
+        let process_outline_text = &process_items[0].text;
+        assert_eq!(
+            process_outline_text, &process_items[1].text,
+            "Both fn process items should have the same outline text"
+        );
+
+        // Add a bookmark inside the SECOND fn process (row 7 = "let config_b = true;")
+        add_bookmarks(&project, &buffer, &[7], cx);
+
+        // Serialize and verify the context_snippet is populated
+        let serialized = get_all_bookmarks(&project, cx);
+        let file_bookmarks = &serialized[&project_path(path!("/project/main.rs"))];
+        assert_eq!(file_bookmarks.len(), 1);
+        assert_eq!(file_bookmarks[0].row, 7);
+        let original_snippet = file_bookmarks[0]
+            .context_snippet
+            .as_ref()
+            .expect("Bookmark should have context_snippet");
+        assert!(
+            original_snippet.contains("config_b"),
+            "Expected snippet for row 7 to contain 'config_b', got: {:?}",
+            original_snippet
+        );
+
+        // Now simulate restoring: construct a serialized bookmark targeting
+        // the second fn process with the correct context_snippet but a wrong
+        // fallback row (row 0). Both fn process share the same symbol path,
+        // so the snippet should disambiguate.
+        let symbol_path = file_bookmarks[0]
+            .symbol_path
+            .as_ref()
+            .expect("Should have symbol_path");
+
+        let serialized_with_snippet = build_syntactic_serialized_with_snippets(&[(
+            path!("/project/main.rs"),
+            &[(
+                0, // wrong fallback row
+                Some(symbol_path.iter().map(|s| s.as_str()).collect()),
+                Some(1), // offset within symbol
+                Some(original_snippet.as_str()),
+            )],
+        )]);
+
+        clear_bookmarks(&project, cx);
+        restore_bookmarks(&project, serialized_with_snippet, cx).await;
+        trigger_resolution(&project, &buffer, cx);
+
+        let restored = get_all_bookmarks(&project, cx);
+        let restored_bookmarks = &restored[&project_path(path!("/project/main.rs"))];
+        assert_eq!(restored_bookmarks.len(), 1);
+
+        // The bookmark should resolve to row 7 (inside the SECOND fn process),
+        // not row 2 (inside the first fn process), because the snippet matched.
+        assert_eq!(
+            restored_bookmarks[0].row, 7,
+            "Snippet should disambiguate to the second fn process (row 7), not the first (row 2)"
+        );
+
+        // Now verify that WITHOUT a snippet, it would pick the first match.
+        let serialized_without_snippet = build_syntactic_serialized_with_snippets(&[(
+            path!("/project/main.rs"),
+            &[(
+                0,
+                Some(symbol_path.iter().map(|s| s.as_str()).collect()),
+                Some(1),
+                None, // no snippet
+            )],
+        )]);
+
+        clear_bookmarks(&project, cx);
+        restore_bookmarks(&project, serialized_without_snippet, cx).await;
+        trigger_resolution(&project, &buffer, cx);
+
+        let restored_no_snippet = get_all_bookmarks(&project, cx);
+        let restored_no_snippet_bookmarks =
+            &restored_no_snippet[&project_path(path!("/project/main.rs"))];
+        assert_eq!(restored_no_snippet_bookmarks.len(), 1);
+
+        // Without snippet, should fall back to first match (row 2 inside first fn process)
+        assert_eq!(
+            restored_no_snippet_bookmarks[0].row, 2,
+            "Without snippet, should resolve to first match (row 2)"
         );
     }
 }

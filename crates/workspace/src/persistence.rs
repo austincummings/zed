@@ -373,12 +373,13 @@ pub struct Bookmark {
     pub row: u32,
     pub symbol_path: Option<String>,
     pub offset_in_symbol: Option<u32>,
+    pub context_snippet: Option<String>,
 }
 
 impl sqlez::bindable::StaticColumnCount for Bookmark {
     fn column_count() -> usize {
-        // row, symbol_path, offset_in_symbol
-        3
+        // row, symbol_path, offset_in_symbol, context_snippet
+        4
     }
 }
 
@@ -393,9 +394,13 @@ impl sqlez::bindable::Bind for Bookmark {
             Some(path) => statement.bind(path, next_index)?,
             None => statement.bind(&None::<&str>, next_index)?,
         };
-        match self.offset_in_symbol {
-            Some(offset) => statement.bind(&(offset as i32), next_index),
-            None => statement.bind(&None::<i32>, next_index),
+        let next_index = match self.offset_in_symbol {
+            Some(offset) => statement.bind(&(offset as i32), next_index)?,
+            None => statement.bind(&None::<i32>, next_index)?,
+        };
+        match &self.context_snippet {
+            Some(snippet) => statement.bind(snippet, next_index),
+            None => statement.bind(&None::<&str>, next_index),
         }
     }
 }
@@ -428,13 +433,26 @@ impl Column for Bookmark {
             statement.column_int(start_index + 2).ok().map(|v| v as u32)
         };
 
+        let context_snippet = if matches!(
+            statement.column_type(start_index + 3),
+            Ok(db::sqlez::statement::SqlType::Null)
+        ) {
+            None
+        } else {
+            statement
+                .column_text(start_index + 3)
+                .ok()
+                .map(|s| s.to_string())
+        };
+
         Ok((
             Bookmark {
                 row,
                 symbol_path,
                 offset_in_symbol,
+                context_snippet,
             },
-            start_index + 3,
+            start_index + 4,
         ))
     }
 }
@@ -1056,6 +1074,9 @@ impl Domain for WorkspaceDb {
             ALTER TABLE bookmarks ADD COLUMN symbol_path TEXT;
             ALTER TABLE bookmarks ADD COLUMN offset_in_symbol INTEGER;
         ),
+        sql!(
+            ALTER TABLE bookmarks ADD COLUMN context_snippet TEXT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1291,7 +1312,7 @@ impl WorkspaceDb {
     fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
         let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
             .select_bound(sql! {
-                SELECT path, row, symbol_path, offset_in_symbol
+                SELECT path, row, symbol_path, offset_in_symbol, context_snippet
                 FROM bookmarks
                 WHERE workspace_id = ?
                 ORDER BY path, row
@@ -1317,6 +1338,7 @@ impl WorkspaceDb {
                             row: bookmark.row,
                             symbol_path,
                             offset_in_symbol: bookmark.offset_in_symbol,
+                            context_snippet: bookmark.context_snippet,
                         });
                 }
 
@@ -1483,10 +1505,11 @@ impl WorkspaceDb {
                             .as_ref()
                             .and_then(|sp| serde_json::to_string(sp).ok());
                         let offset_in_symbol = bookmark.offset_in_symbol.map(|v| v as i32);
+                        let context_snippet = bookmark.context_snippet.as_deref();
                         conn.exec_bound(sql!(
-                            INSERT INTO bookmarks (workspace_id, path, row, symbol_path, offset_in_symbol)
-                            VALUES (?1, ?2, ?3, ?4, ?5);
-                        ))?((workspace.id, path.as_ref(), bookmark.row, symbol_path_json, offset_in_symbol)).context("Inserting bookmark")?;
+                            INSERT INTO bookmarks (workspace_id, path, row, symbol_path, offset_in_symbol, context_snippet)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6);
+                        ))?((workspace.id, path.as_ref(), bookmark.row, symbol_path_json, offset_in_symbol, context_snippet)).context("Inserting bookmark")?;
                     }
                 }
 
@@ -4671,11 +4694,13 @@ mod tests {
                             row: 5,
                             symbol_path: None,
                             offset_in_symbol: None,
+                            context_snippet: None,
                         },
                         SerializedBookmark {
                             row: 10,
                             symbol_path: None,
                             offset_in_symbol: None,
+                            context_snippet: None,
                         },
                     ],
                 );
@@ -4732,16 +4757,19 @@ mod tests {
                                 "fn process".to_string(),
                             ]),
                             offset_in_symbol: Some(1),
+                            context_snippet: None,
                         },
                         SerializedBookmark {
                             row: 15,
                             symbol_path: Some(vec!["fn standalone".to_string()]),
                             offset_in_symbol: Some(0),
+                            context_snippet: None,
                         },
                         SerializedBookmark {
                             row: 20,
                             symbol_path: None,
                             offset_in_symbol: None,
+                            context_snippet: None,
                         },
                     ],
                 );
@@ -4810,6 +4838,7 @@ mod tests {
                         row: 5,
                         symbol_path: None,
                         offset_in_symbol: None,
+                        context_snippet: None,
                     }],
                 );
                 map
@@ -4839,6 +4868,7 @@ mod tests {
                         row: 8,
                         symbol_path: Some(vec!["fn updated".to_string()]),
                         offset_in_symbol: Some(2),
+                        context_snippet: None,
                     }],
                 );
                 map

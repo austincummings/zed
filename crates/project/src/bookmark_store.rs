@@ -33,6 +33,9 @@ pub struct SerializedBookmark {
     pub symbol_path: Option<Vec<String>>,
     /// Row offset of the bookmark relative to the start of the innermost symbol.
     pub offset_in_symbol: Option<u32>,
+    /// First 30 characters of the bookmarked line, used to disambiguate when
+    /// multiple outline sections share the same symbol path.
+    pub context_snippet: Option<String>,
 }
 
 #[derive(Debug)]
@@ -219,21 +222,45 @@ impl BookmarkStore {
 
         let innermost_name = symbol_path.last()?;
 
-        // Find candidate items whose text matches the innermost symbol name.
-        let mut best_match: Option<(usize, &OutlineItem<Anchor>)> = None;
+        // Find candidate items whose text matches the innermost symbol name,
+        // collecting all full path matches to allow snippet-based disambiguation.
+        let mut full_matches: Vec<(usize, &OutlineItem<Anchor>)> = Vec::new();
 
         for (index, item) in outline_items.iter().enumerate() {
             if &item.text != innermost_name {
                 continue;
             }
 
-            // Verify the full ancestor chain matches.
             if Self::matches_symbol_path(symbol_path, index, outline_items) {
-                best_match = Some((index, item));
-                // Take the first full match (outline items are in document order).
-                break;
+                full_matches.push((index, item));
             }
         }
+
+        // When multiple outline sections share the same symbol path, use the
+        // context snippet to pick the right one.
+        let best_match = if full_matches.len() > 1 {
+            if let Some(snippet) = bookmark.context_snippet.as_deref() {
+                full_matches
+                    .iter()
+                    .find(|(_, item)| {
+                        let item_start_row = item.range.start.to_point(snapshot).row;
+                        let candidate_row = if let Some(offset) = bookmark.offset_in_symbol {
+                            let item_end_row = item.range.end.to_point(snapshot).row;
+                            (item_start_row + offset).min(item_end_row)
+                        } else {
+                            item_start_row
+                        };
+                        Self::compute_context_snippet(snapshot, candidate_row).as_deref()
+                            == Some(snippet)
+                    })
+                    .or(full_matches.first())
+                    .copied()
+            } else {
+                full_matches.first().copied()
+            }
+        } else {
+            full_matches.first().copied()
+        };
 
         // If exact match failed, try matching just the innermost name.
         let matched_item = best_match.map(|(_, item)| item).or_else(|| {
@@ -383,6 +410,33 @@ impl BookmarkStore {
         let offset = row.saturating_sub(item_start_row);
 
         (Some(symbol_path), Some(offset))
+    }
+
+    const CONTEXT_SNIPPET_MAX_LEN: usize = 30;
+
+    /// Extract the first 30 characters of text at the given row, trimmed of
+    /// leading/trailing whitespace. Used to disambiguate bookmarks in duplicate
+    /// outline sections that share the same symbol path.
+    pub fn compute_context_snippet(
+        snapshot: &language::BufferSnapshot,
+        row: u32,
+    ) -> Option<String> {
+        let max_row = snapshot.max_point().row;
+        if row > max_row {
+            return None;
+        }
+        let line_start = Point::new(row, 0);
+        let line_end = Point::new(row, snapshot.line_len(row));
+        let line_text: String = snapshot.text_for_range(line_start..line_end).collect();
+        let trimmed = line_text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let clipped: String = trimmed
+            .chars()
+            .take(Self::CONTEXT_SNIPPET_MAX_LEN)
+            .collect();
+        Some(clipped)
     }
 
     /// Toggle a bookmark at the given anchor in the buffer.
@@ -611,10 +665,12 @@ impl BookmarkStore {
                                     snapshot.summary_for_anchor::<Point>(&bookmark.anchor()).row;
                                 let (symbol_path, offset_in_symbol) =
                                     Self::compute_syntactic_context(&snapshot, row);
+                                let context_snippet = Self::compute_context_snippet(&snapshot, row);
                                 Some(SerializedBookmark {
                                     row,
                                     symbol_path,
                                     offset_in_symbol,
+                                    context_snippet,
                                 })
                             })
                             .collect()
