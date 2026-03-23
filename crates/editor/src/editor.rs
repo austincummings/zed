@@ -12302,7 +12302,7 @@ impl Editor {
                                 )
                             })
                             .into_iter()
-                            .map(|bookmark| Anchor::in_buffer(excerpt_id, bookmark.anchor()))
+                            .map(|bookmark| Anchor::in_buffer(excerpt_id, bookmark.anchor.0))
                             .collect::<Vec<_>>()
                     })
                     .collect()

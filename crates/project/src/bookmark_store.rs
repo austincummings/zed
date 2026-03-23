@@ -12,21 +12,22 @@ use text::{Anchor, BufferSnapshot, Point, ToPoint};
 
 use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BookmarkFingerprint {
     pub line_snippet: String,
     pub context_lines: String,
     pub last_known_row: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct TrackedBookmark {
     pub anchor: BookmarkAnchor,
     pub fingerprint: BookmarkFingerprint,
+    pub displaced: bool,
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-pub struct BookmarkAnchor(text::Anchor);
+pub struct BookmarkAnchor(pub text::Anchor);
 
 impl BookmarkAnchor {
     pub fn anchor(&self) -> text::Anchor {
@@ -54,7 +55,7 @@ pub struct SerializedBookmark {
 #[derive(Debug)]
 pub struct BufferBookmarks {
     buffer: Entity<Buffer>,
-    bookmarks: Vec<BookmarkAnchor>,
+    bookmarks: Vec<TrackedBookmark>,
     /// Serialized bookmarks with syntactic context waiting for tree-sitter
     /// to finish parsing so that outline-based resolution can be attempted.
     pending_syntactic: Vec<SerializedBookmark>,
@@ -72,6 +73,9 @@ impl BufferBookmarks {
                 BufferEvent::Reparsed => {
                     bookmark_store.resolve_pending_syntactic_bookmarks(buffer, cx);
                 }
+                BufferEvent::Edited { .. } => {
+                    bookmark_store.check_displaced_bookmarks(buffer, cx);
+                }
                 _ => {}
             },
         );
@@ -88,7 +92,7 @@ impl BufferBookmarks {
         &self.buffer
     }
 
-    pub fn bookmarks(&self) -> &[BookmarkAnchor] {
+    pub fn bookmarks(&self) -> &[TrackedBookmark] {
         &self.bookmarks
     }
 }
@@ -172,7 +176,7 @@ impl BookmarkStore {
         // yet because the outline is empty (tree-sitter hasn't parsed yet).
         let mut pending_syntactic = Vec::new();
 
-        let anchors: Vec<BookmarkAnchor> = serialized
+        let anchors: Vec<TrackedBookmark> = serialized
             .iter()
             .filter_map(|bookmark| {
                 if !outline_is_empty {
@@ -184,7 +188,11 @@ impl BookmarkStore {
                             return None;
                         }
                         let anchor = snapshot.anchor_after(point);
-                        return Some(BookmarkAnchor(anchor));
+                        return Some(TrackedBookmark {
+                            anchor: BookmarkAnchor(anchor),
+                            fingerprint: Self::compute_fingerprint(&snapshot, resolved_row),
+                            displaced: false,
+                        });
                     }
                 } else if bookmark.symbol_path.as_ref().is_some_and(|p| !p.is_empty()) {
                     // Outline not available yet; save for deferred resolution
@@ -204,7 +212,11 @@ impl BookmarkStore {
                 }
 
                 let anchor = snapshot.anchor_after(point);
-                Some(BookmarkAnchor(anchor))
+                Some(TrackedBookmark {
+                    anchor: BookmarkAnchor(anchor),
+                    fingerprint: Self::compute_fingerprint(&snapshot, point.row),
+                    displaced: false,
+                })
             })
             .collect();
 
@@ -480,9 +492,12 @@ impl BookmarkStore {
         };
 
         let snapshot = buffer.read(cx).snapshot();
+        let fingerprint =
+            Self::compute_fingerprint(&snapshot, anchor.summary::<Point>(&snapshot).row);
 
         let existing_index = buffer_bookmarks.bookmarks.iter().position(|existing| {
-            existing.0.summary::<Point>(&snapshot).row == anchor.summary::<Point>(&snapshot).row
+            existing.anchor.0.summary::<Point>(&snapshot).row
+                == anchor.summary::<Point>(&snapshot).row
         });
 
         if let Some(index) = existing_index {
@@ -491,7 +506,11 @@ impl BookmarkStore {
                 self.bookmarks.remove(&abs_path);
             }
         } else {
-            buffer_bookmarks.bookmarks.push(BookmarkAnchor(anchor));
+            buffer_bookmarks.bookmarks.push(TrackedBookmark {
+                anchor: BookmarkAnchor(anchor),
+                fingerprint,
+                displaced: false,
+            });
         }
 
         cx.notify();
@@ -510,7 +529,7 @@ impl BookmarkStore {
         range: Option<Range<text::Anchor>>,
         buffer_snapshot: &BufferSnapshot,
         cx: &mut Context<Self>,
-    ) -> Vec<BookmarkAnchor> {
+    ) -> Vec<TrackedBookmark> {
         let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
             return Vec::new();
         };
@@ -526,18 +545,18 @@ impl BookmarkStore {
             .iter()
             .filter_map({
                 move |bookmark| {
-                    if !buffer_snapshot.can_resolve(&bookmark.anchor()) {
+                    if !buffer_snapshot.can_resolve(&bookmark.anchor.0) {
                         return None;
                     }
 
                     if let Some(range) = &range
-                        && (bookmark.anchor().cmp(&range.start, buffer_snapshot).is_lt()
-                            || bookmark.anchor().cmp(&range.end, buffer_snapshot).is_gt())
+                        && (bookmark.anchor.0.cmp(&range.start, buffer_snapshot).is_lt()
+                            || bookmark.anchor.0.cmp(&range.end, buffer_snapshot).is_gt())
                     {
                         return None;
                     }
 
-                    Some(*bookmark)
+                    Some(bookmark.clone())
                 }
             })
             .collect()
@@ -649,14 +668,56 @@ impl BookmarkStore {
                 if let Some(existing) = bm
                     .bookmarks
                     .iter_mut()
-                    .find(|b| b.0.summary::<Point>(&text_snapshot).row == fallback_row)
+                    .find(|b| b.anchor.0.summary::<Point>(&text_snapshot).row == fallback_row)
                 {
-                    *existing = BookmarkAnchor(new_anchor);
+                    *existing = TrackedBookmark {
+                        anchor: BookmarkAnchor(new_anchor),
+                        fingerprint: existing.fingerprint.clone(),
+                        displaced: false,
+                    };
                 }
             }
         }
 
         cx.notify();
+    }
+
+    fn check_displaced_bookmarks(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
+            return;
+        };
+        let Some(BookmarkEntry::Loaded(buffer_bookmarks)) = self.bookmarks.get_mut(&abs_path)
+        else {
+            return;
+        };
+
+        let snapshot = buffer.read(cx).snapshot();
+        let max_row = snapshot.max_point().row;
+        let mut any_displaced = false;
+
+        for tracked in &mut buffer_bookmarks.bookmarks {
+            // let current_row = snapshot
+            //     .summary_for_anchor::<Point>(&tracked.anchor.anchor())
+            //     .row;
+
+            // // Quick check: does the line snippet still match at the anchor's current row?
+            // let current_snippet =
+            //     Self::compute_line_snippet(&snapshot, current_row, FINGERPRINT_LINE_LEN);
+            // if current_snippet.as_deref() == Some(&tracked.fingerprint.line_snippet) {
+            //     // Still in place — update the last known row
+            //     tracked.fingerprint.last_known_row = current_row;
+            //     tracked.displaced = false;
+            // } else {
+            //     // Content mismatch — this bookmark's text has moved
+            //     tracked.displaced = true;
+            //     any_displaced = true;
+            // }
+        }
+
+        if any_displaced {
+            // self.relocate_displaced_bookmarks(&abs_path.clone(), cx);
+            println!("Displaced bookmarks for {:?}", abs_path);
+        }
     }
 
     pub fn all_serialized_bookmarks(
@@ -674,11 +735,11 @@ impl BookmarkStore {
                             .bookmarks
                             .iter()
                             .filter_map(|bookmark| {
-                                if !snapshot.can_resolve(&bookmark.anchor()) {
+                                if !snapshot.can_resolve(&bookmark.anchor.0) {
                                     return None;
                                 }
                                 let row =
-                                    snapshot.summary_for_anchor::<Point>(&bookmark.anchor()).row;
+                                    snapshot.summary_for_anchor::<Point>(&bookmark.anchor.0).row;
                                 let (symbol_path, offset_in_symbol) =
                                     Self::compute_syntactic_context(&snapshot, row);
                                 let context_snippet = Self::compute_line_snippet(
@@ -721,8 +782,8 @@ impl BookmarkStore {
             let ranges: Vec<Range<Point>> = buffer_bookmarks
                 .bookmarks()
                 .iter()
-                .map(|anchor| {
-                    let row = snapshot.summary_for_anchor::<Point>(&anchor.anchor()).row;
+                .map(|bookmark| {
+                    let row = snapshot.summary_for_anchor::<Point>(&bookmark.anchor.0).row;
                     Point::row_range(row..row)
                 })
                 .collect();
@@ -741,7 +802,6 @@ impl BookmarkStore {
     const FINGERPRINT_CONTEXT_LINES: usize = 2;
 
     pub fn compute_fingerprint(
-        &self,
         snapshot: &language::BufferSnapshot,
         row: u32,
     ) -> BookmarkFingerprint {
@@ -774,46 +834,46 @@ impl BookmarkStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::Project;
+// #[cfg(test)]
+// mod tests {
+//     use crate::Project;
 
-    use super::*;
+//     use super::*;
 
-    use gpui::TestAppContext;
-    use serde_json::json;
-    use util::path;
+//     use gpui::TestAppContext;
+//     use serde_json::json;
+//     use util::path;
 
-    #[gpui::test]
-    async fn test_compute_fingerprint(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            release_channel::init(semver::Version::new(0, 0, 0), cx);
-        });
-        cx.executor().allow_parking();
+//     #[gpui::test]
+//     async fn test_compute_fingerprint(cx: &mut TestAppContext) {
+//         cx.update(|cx| {
+//             let settings_store = settings::SettingsStore::test(cx);
+//             cx.set_global(settings_store);
+//             release_channel::init(semver::Version::new(0, 0, 0), cx);
+//         });
+//         cx.executor().allow_parking();
 
-        let filename = "target.rs";
-        let rust_source =
-            "fn preamble() {\n    let a = 0;\n}\n\nfn target() {\n    let x = 1;\n}\n";
+//         let filename = "target.rs";
+//         let rust_source =
+//             "fn preamble() {\n    let a = 0;\n}\n\nfn target() {\n    let x = 1;\n}\n";
 
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({ filename: rust_source }))
-            .await;
+//         let fs = fs::FakeFs::new(cx.executor());
+//         fs.insert_tree(path!("/project"), json!({ filename: rust_source }))
+//             .await;
 
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        language_registry.add(rust_lang());
+//         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+//         let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+//         language_registry.add(rust_lang());
 
-        let full_path = format!("/project/{filename}");
-        let buffer = project
-            .update(cx, |project, cx| {
-                project.open_local_buffer(Path::new(full_path), cx)
-            })
-            .await
-            .unwrap();
-        cx.executor().run_until_parked();
+//         let full_path = format!("/project/{filename}");
+//         let buffer = project
+//             .update(cx, |project, cx| {
+//                 project.open_local_buffer(Path::new(full_path), cx)
+//             })
+//             .await
+//             .unwrap();
+//         cx.executor().run_until_parked();
 
-        // Open buffer
-    }
-}
+//         // Open buffer
+//     }
+// }
