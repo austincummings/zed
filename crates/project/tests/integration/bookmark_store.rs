@@ -3,7 +3,10 @@ use std::{path::Path, sync::Arc};
 use collections::BTreeMap;
 use gpui::{Entity, TestAppContext};
 use language::Buffer;
-use project::{Project, bookmark_store::SerializedBookmark};
+use project::{
+    Project,
+    bookmark_store::{SerializedBookmark, TrackedBookmark},
+};
 use serde_json::json;
 use util::path;
 
@@ -733,6 +736,19 @@ mod integration {
         (project, fs, buffer)
     }
 
+    fn get_tracked_bookmarks(
+        project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        cx: &mut TestAppContext,
+    ) -> Vec<TrackedBookmark> {
+        project.update(cx, |project, cx| {
+            let snapshot = buffer.read(cx).snapshot();
+            project.bookmark_store().update(cx, |store, cx| {
+                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx)
+            })
+        })
+    }
+
     /// Triggers syntactic bookmark resolution by calling `bookmarks_for_buffer`.
     fn trigger_resolution(
         project: &Entity<Project>,
@@ -1308,6 +1324,253 @@ fn process() {\n\
         assert_eq!(
             restored_no_snippet_bookmarks[0].row, 2,
             "Without snippet, should resolve to first match (row 2)"
+        );
+    }
+
+    // Row 0: bytes  0..5  ("line0"), newline at 5
+    // Row 1: bytes  6..11 ("line1"), newline at 11
+    // Row 2: bytes 12..17 ("line2"), newline at 17
+    // Row 3: bytes 18..23 ("line3"), newline at 23
+    // Row 4: bytes 24..29 ("line4"), newline at 29
+    const DISPLACED_TEST_FILE: &str = "line0\nline1\nline2\nline3\nline4\n";
+
+    #[gpui::test]
+    async fn test_displaced_bookmarks_not_displaced_when_other_line_edited(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"file.rs": DISPLACED_TEST_FILE}))
+            .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+
+        add_bookmarks(&project, &buffer, &[2], cx);
+
+        // Edit a line that is not the bookmarked line (row 4).
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(24..29, "YYYYY")], None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let bookmarks = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(bookmarks.len(), 1);
+        assert!(
+            !bookmarks[0].displaced,
+            "Bookmark should not be displaced when an unrelated line is edited"
+        );
+        assert_eq!(
+            bookmarks[0].fingerprint.last_known_row, 2,
+            "last_known_row should remain at row 2"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_displaced_bookmarks_marks_displaced_when_content_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"file.rs": DISPLACED_TEST_FILE}))
+            .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+
+        add_bookmarks(&project, &buffer, &[2], cx);
+
+        // Overwrite the bookmarked line's content — the fingerprint no longer matches.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(12..17, "XXXXX")], None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let bookmarks = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(bookmarks.len(), 1);
+        assert!(
+            bookmarks[0].displaced,
+            "Bookmark should be displaced when its line content changes"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_displaced_bookmarks_cleared_when_content_restored(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"file.rs": DISPLACED_TEST_FILE}))
+            .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+
+        add_bookmarks(&project, &buffer, &[2], cx);
+
+        // First displace the bookmark by changing the line content.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(12..17, "XXXXX")], None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let bookmarks = get_tracked_bookmarks(&project, &buffer, cx);
+        assert!(
+            bookmarks[0].displaced,
+            "Bookmark should be displaced after content change"
+        );
+
+        // Restore the original content — the fingerprint matches again.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(12..17, "line2")], None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let bookmarks = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(bookmarks.len(), 1);
+        assert!(
+            !bookmarks[0].displaced,
+            "Bookmark should no longer be displaced after original content is restored"
+        );
+        assert_eq!(
+            bookmarks[0].fingerprint.last_known_row, 2,
+            "last_known_row should be 2 after restoration"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_displaced_bookmarks_updates_last_known_row_when_anchor_shifts(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"file.rs": DISPLACED_TEST_FILE}))
+            .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+
+        add_bookmarks(&project, &buffer, &[2], cx);
+
+        let initial = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(initial[0].fingerprint.last_known_row, 2);
+        assert!(!initial[0].displaced);
+
+        // Insert a new line before row 2, shifting the bookmark's anchor to row 3.
+        // The bookmarked content ("line2") is unchanged — only its row has moved.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(12..12, "inserted\n")], None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let bookmarks = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(bookmarks.len(), 1);
+        assert!(
+            !bookmarks[0].displaced,
+            "Bookmark should not be displaced when its content is unchanged but row shifts"
+        );
+        assert_eq!(
+            bookmarks[0].fingerprint.last_known_row, 3,
+            "last_known_row should be updated to 3 after the anchor shifts down"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_displaced_bookmark_not_relocated_to_duplicate_symbol(cx: &mut TestAppContext) {
+        // Two `fn c()` definitions with different #[cfg] attributes.
+        // A bookmark inside the second fn c() should stay there when its
+        // line is deleted, NOT jump to the first fn c().
+        let rust_source = "\
+#[cfg(test)]\n\
+fn a() {\n\
+    // Bookmark is not here\n\
+}\n\
+\n\
+#[cfg(feature = \"\")]\n\
+fn c() {\n\
+    // Bookmark is not supposed to be here\n\
+}\n\
+\n\
+#[cfg(not(test))]\n\
+fn c() {\n\
+    // Bookmark is supposed to be here\n\
+}\n";
+
+        let (project, _fs, buffer) = setup_rust_project(rust_source, "main.rs", cx).await;
+
+        // Verify outline has two fn c() items
+        let outline_items = buffer.read_with(cx, |buffer, _cx| {
+            let snapshot = buffer.snapshot();
+            let outline = snapshot.outline(None);
+            outline.items
+        });
+        let c_items: Vec<_> = outline_items
+            .iter()
+            .filter(|item| item.text.contains("c"))
+            .collect();
+        assert!(
+            c_items.len() >= 2,
+            "Expected at least 2 'fn c' outline items, got {}: {:?}",
+            c_items.len(),
+            c_items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
+
+        // Row 12 is "// Bookmark is supposed to be here" inside the second fn c()
+        let bookmark_row = 12;
+        add_bookmarks(&project, &buffer, &[bookmark_row], cx);
+
+        // Verify the bookmark is inside the second fn c()
+        let tracked = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(tracked.len(), 1);
+        assert!(!tracked[0].displaced);
+        assert_eq!(tracked[0].fingerprint.last_known_row, bookmark_row);
+
+        // Verify the bookmark has syntactic context pointing to fn c
+        assert!(
+            tracked[0].symbol_path.is_some(),
+            "Bookmark should have symbol_path"
+        );
+        let symbol_path = tracked[0].symbol_path.as_ref().unwrap();
+        assert!(
+            symbol_path.iter().any(|s| s.contains("c")),
+            "symbol_path should reference fn c, got: {:?}",
+            symbol_path
+        );
+
+        // Now delete the bookmarked line (simulating a "cut" operation).
+        // "// Bookmark is supposed to be here\n" is on row 12.
+        // After deletion, the anchor should remain inside the second fn c().
+        buffer.update(cx, |buffer, cx| {
+            let snapshot = buffer.snapshot();
+            let line_start = text::Point::new(bookmark_row, 0);
+            let line_end = text::Point::new(bookmark_row + 1, 0);
+            let start_offset = snapshot.point_to_offset(line_start);
+            let end_offset = snapshot.point_to_offset(line_end);
+            buffer.edit([(start_offset..end_offset, "")], None, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let after_cut = get_tracked_bookmarks(&project, &buffer, cx);
+        assert_eq!(after_cut.len(), 1, "Bookmark should still exist after cut");
+
+        // The critical assertion: the bookmark should NOT have moved to the
+        // first fn c(). It should remain in or near the second fn c().
+        //
+        // The second fn c() starts at row 11 (after the line deletion, which
+        // removed row 12, so the closing brace is now row 12).
+        // The first fn c() body is around row 7 ("// Bookmark is not supposed to be here").
+        let after_cut_row = after_cut[0].fingerprint.last_known_row;
+        assert!(
+            after_cut_row >= 11,
+            "Bookmark should remain in the second fn c() (row >= 11), but was relocated to row {}. \
+             If row is ~7, the bookmark was incorrectly relocated to the first fn c().",
+            after_cut_row
         );
     }
 }

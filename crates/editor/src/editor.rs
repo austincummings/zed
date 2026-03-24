@@ -8947,7 +8947,7 @@ impl Editor {
                 )
             });
             for bookmark in bookmarks {
-                let multi_buffer_anchor = Anchor::in_buffer(excerpt_id, bookmark.anchor());
+                let multi_buffer_anchor = Anchor::in_buffer(excerpt_id, bookmark.anchor.anchor());
                 let position = multi_buffer_anchor
                     .to_point(&multi_buffer_snapshot)
                     .to_display_point(&snapshot);

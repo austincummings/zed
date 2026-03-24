@@ -23,6 +23,8 @@ pub struct BookmarkFingerprint {
 pub struct TrackedBookmark {
     pub anchor: BookmarkAnchor,
     pub fingerprint: BookmarkFingerprint,
+    pub symbol_path: Option<Vec<String>>,
+    pub offset_in_symbol: Option<u32>,
     pub displaced: bool,
 }
 
@@ -74,7 +76,8 @@ impl BufferBookmarks {
                     bookmark_store.resolve_pending_syntactic_bookmarks(buffer, cx);
                 }
                 BufferEvent::Edited { .. } => {
-                    bookmark_store.check_displaced_bookmarks(buffer, cx);
+                    bookmark_store.check_displaced_bookmarks(buffer.clone(), cx);
+                    bookmark_store.update_bookmark_contexts(buffer, cx);
                 }
                 _ => {}
             },
@@ -190,6 +193,8 @@ impl BookmarkStore {
                         let anchor = snapshot.anchor_after(point);
                         return Some(TrackedBookmark {
                             anchor: BookmarkAnchor(anchor),
+                            symbol_path: bookmark.symbol_path.clone(),
+                            offset_in_symbol: bookmark.offset_in_symbol,
                             fingerprint: Self::compute_fingerprint(&snapshot, resolved_row),
                             displaced: false,
                         });
@@ -215,6 +220,8 @@ impl BookmarkStore {
                 Some(TrackedBookmark {
                     anchor: BookmarkAnchor(anchor),
                     fingerprint: Self::compute_fingerprint(&snapshot, point.row),
+                    symbol_path: bookmark.symbol_path.clone(),
+                    offset_in_symbol: bookmark.offset_in_symbol,
                     displaced: false,
                 })
             })
@@ -492,13 +499,15 @@ impl BookmarkStore {
         };
 
         let snapshot = buffer.read(cx).snapshot();
-        let fingerprint =
-            Self::compute_fingerprint(&snapshot, anchor.summary::<Point>(&snapshot).row);
+        let row = anchor.summary::<Point>(&snapshot).row;
+        let fingerprint = Self::compute_fingerprint(&snapshot, row);
 
-        let existing_index = buffer_bookmarks.bookmarks.iter().position(|existing| {
-            existing.anchor.0.summary::<Point>(&snapshot).row
-                == anchor.summary::<Point>(&snapshot).row
-        });
+        let existing_index = buffer_bookmarks
+            .bookmarks
+            .iter()
+            .position(|existing| existing.anchor.0.summary::<Point>(&snapshot).row == row);
+
+        let (symbol_path, offset_in_symbol) = Self::compute_syntactic_context(&snapshot, row);
 
         if let Some(index) = existing_index {
             buffer_bookmarks.bookmarks.remove(index);
@@ -508,6 +517,8 @@ impl BookmarkStore {
         } else {
             buffer_bookmarks.bookmarks.push(TrackedBookmark {
                 anchor: BookmarkAnchor(anchor),
+                symbol_path,
+                offset_in_symbol,
                 fingerprint,
                 displaced: false,
             });
@@ -545,6 +556,10 @@ impl BookmarkStore {
             .iter()
             .filter_map({
                 move |bookmark| {
+                    if bookmark.displaced {
+                        return None;
+                    }
+
                     if !buffer_snapshot.can_resolve(&bookmark.anchor.0) {
                         return None;
                     }
@@ -672,6 +687,8 @@ impl BookmarkStore {
                 {
                     *existing = TrackedBookmark {
                         anchor: BookmarkAnchor(new_anchor),
+                        symbol_path: serialized.symbol_path.clone(),
+                        offset_in_symbol: serialized.offset_in_symbol,
                         fingerprint: existing.fingerprint.clone(),
                         displaced: false,
                     };
@@ -680,6 +697,31 @@ impl BookmarkStore {
         }
 
         cx.notify();
+    }
+
+    fn update_bookmark_contexts(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
+            return;
+        };
+        let Some(BookmarkEntry::Loaded(buffer_bookmarks)) = self.bookmarks.get_mut(&abs_path)
+        else {
+            return;
+        };
+
+        let snapshot = buffer.read(cx).snapshot();
+
+        for tracked in &mut buffer_bookmarks.bookmarks {
+            if !tracked.displaced {
+                let current_row = snapshot
+                    .summary_for_anchor::<Point>(&tracked.anchor.anchor())
+                    .row;
+                tracked.fingerprint = Self::compute_fingerprint(&snapshot, current_row);
+                let (symbol_path, offset_in_symbol) =
+                    Self::compute_syntactic_context(&snapshot, current_row);
+                tracked.symbol_path = symbol_path;
+                tracked.offset_in_symbol = offset_in_symbol;
+            }
+        }
     }
 
     fn check_displaced_bookmarks(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -692,31 +734,89 @@ impl BookmarkStore {
         };
 
         let snapshot = buffer.read(cx).snapshot();
-        let max_row = snapshot.max_point().row;
-        let mut any_displaced = false;
 
         for tracked in &mut buffer_bookmarks.bookmarks {
-            // let current_row = snapshot
-            //     .summary_for_anchor::<Point>(&tracked.anchor.anchor())
-            //     .row;
+            let current_row = snapshot
+                .summary_for_anchor::<Point>(&tracked.anchor.anchor())
+                .row;
 
-            // // Quick check: does the line snippet still match at the anchor's current row?
-            // let current_snippet =
-            //     Self::compute_line_snippet(&snapshot, current_row, FINGERPRINT_LINE_LEN);
-            // if current_snippet.as_deref() == Some(&tracked.fingerprint.line_snippet) {
-            //     // Still in place — update the last known row
-            //     tracked.fingerprint.last_known_row = current_row;
-            //     tracked.displaced = false;
-            // } else {
-            //     // Content mismatch — this bookmark's text has moved
-            //     tracked.displaced = true;
-            //     any_displaced = true;
-            // }
+            let current_snippet =
+                Self::compute_line_snippet(&snapshot, current_row, Self::FINGERPRINT_LINE_LEN);
+            if current_snippet.as_deref() == Some(&tracked.fingerprint.line_snippet) {
+                if tracked.displaced || tracked.fingerprint.last_known_row != current_row {
+                    tracked.fingerprint.last_known_row = current_row;
+                    tracked.displaced = false;
+                }
+            } else {
+                if !tracked.displaced {
+                    tracked.displaced = true;
+                }
+            }
         }
 
-        if any_displaced {
-            // self.relocate_displaced_bookmarks(&abs_path.clone(), cx);
-            println!("Displaced bookmarks for {:?}", abs_path);
+        self.relocate_displaced_bookmarks(&abs_path.clone(), cx);
+    }
+
+    fn relocate_displaced_bookmarks(&mut self, abs_path: &Arc<Path>, cx: &mut Context<Self>) {
+        let Some(BookmarkEntry::Loaded(buffer_bookmarks)) = self.bookmarks.get_mut(abs_path) else {
+            return;
+        };
+
+        let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
+        let outline = snapshot.outline(None);
+        let outline_items = &outline.items;
+        let max_point = snapshot.max_point();
+
+        let mut changed = false;
+
+        for tracked in &mut buffer_bookmarks.bookmarks {
+            if !tracked.displaced {
+                continue;
+            }
+
+            // Resolve the anchors current row
+            let current_row = snapshot
+                .summary_for_anchor::<Point>(&tracked.anchor.anchor())
+                .row;
+            let (current_symbol_path, current_offset_in_symbol) =
+                Self::compute_syntactic_context(&snapshot, current_row);
+
+            // Try to re-resolve using stored symbol context
+            let resolved_row = if let Some(ref symbol_path) = tracked.symbol_path {
+                if !symbol_path.is_empty() {
+                    Self::resolve_syntactic_bookmark(
+                        &SerializedBookmark {
+                            row: tracked.fingerprint.last_known_row,
+                            symbol_path: Some(symbol_path.clone()),
+                            offset_in_symbol: tracked.offset_in_symbol.clone(),
+                            context_snippet: Some(tracked.fingerprint.context_lines.clone()),
+                        },
+                        outline_items,
+                        &snapshot,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(row) = resolved_row {
+                let point = Point::new(row, 0);
+                if point <= max_point {
+                    tracked.anchor = BookmarkAnchor(snapshot.anchor_after(point));
+                    tracked.fingerprint.last_known_row = row;
+                    tracked.fingerprint.line_snippet =
+                        Self::compute_line_snippet(&snapshot, row, Self::FINGERPRINT_LINE_LEN)
+                            .unwrap_or_default();
+                    tracked.displaced = false;
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            cx.notify();
         }
     }
 
