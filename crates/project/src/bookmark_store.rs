@@ -30,15 +30,15 @@ pub struct SerializedBookmark {
 }
 
 #[derive(Debug)]
-pub struct BufferBookmarks {
+pub struct ActiveBufferBookmarks {
     buffer: Entity<Buffer>,
-    bookmarks: Vec<BookmarkAnchor>,
+    anchors: Vec<BookmarkAnchor>,
     pending: Vec<SerializedBookmark>,
 
     _subscription: Subscription,
 }
 
-impl BufferBookmarks {
+impl ActiveBufferBookmarks {
     pub fn new(buffer: Entity<Buffer>, cx: &mut Context<BookmarkStore>) -> Self {
         let subscription = cx.subscribe(
             &buffer,
@@ -55,7 +55,7 @@ impl BufferBookmarks {
 
         Self {
             buffer,
-            bookmarks: Vec::new(),
+            anchors: Vec::new(),
             pending: Vec::new(),
             _subscription: subscription,
         }
@@ -66,21 +66,21 @@ impl BufferBookmarks {
     }
 
     pub fn bookmarks(&self) -> &[BookmarkAnchor] {
-        &self.bookmarks
+        &self.anchors
     }
 }
 
 #[derive(Debug)]
-pub enum BookmarkEntry {
-    Loaded(BufferBookmarks),
-    Unloaded(Vec<SerializedBookmark>),
+pub enum FileBookmarks {
+    Active(ActiveBufferBookmarks),
+    Inactive(Vec<SerializedBookmark>),
 }
 
-impl BookmarkEntry {
+impl FileBookmarks {
     pub fn is_empty(&self) -> bool {
         match self {
-            BookmarkEntry::Loaded(buffer_bookmarks) => buffer_bookmarks.bookmarks.is_empty(),
-            BookmarkEntry::Unloaded(rows) => rows.is_empty(),
+            FileBookmarks::Active(buffer_bookmarks) => buffer_bookmarks.anchors.is_empty(),
+            FileBookmarks::Inactive(serialized_bookmarks) => serialized_bookmarks.is_empty(),
         }
     }
 }
@@ -88,7 +88,7 @@ impl BookmarkEntry {
 pub struct BookmarkStore {
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
-    bookmarks: BTreeMap<Arc<Path>, BookmarkEntry>,
+    bookmarks: BTreeMap<Arc<Path>, FileBookmarks>,
 }
 
 impl BookmarkStore {
@@ -117,7 +117,7 @@ impl BookmarkStore {
             log::debug!("Stored {count} unloaded {word} at {}", path.display());
 
             self.bookmarks
-                .insert(path, BookmarkEntry::Unloaded(serialized));
+                .insert(path, FileBookmarks::Inactive(serialized));
         }
 
         cx.notify();
@@ -130,7 +130,7 @@ impl BookmarkStore {
         buffer: &Entity<Buffer>,
         cx: &mut Context<Self>,
     ) {
-        let Some(BookmarkEntry::Unloaded(serialized)) = self.bookmarks.get(abs_path) else {
+        let Some(FileBookmarks::Inactive(serialized)) = self.bookmarks.get(abs_path) else {
             return;
         };
 
@@ -185,13 +185,13 @@ impl BookmarkStore {
         if anchors.is_empty() && pending.is_empty() {
             self.bookmarks.remove(abs_path);
         } else {
-            let mut buffer_bookmarks = BufferBookmarks::new(buffer.clone(), cx);
-            buffer_bookmarks.bookmarks = anchors;
+            let mut active_bookmarks = ActiveBufferBookmarks::new(buffer.clone(), cx);
+            active_bookmarks.anchors = anchors;
             if has_syntactic_bookmarks && outline_is_empty {
-                buffer_bookmarks.pending = pending;
+                active_bookmarks.pending = pending;
             }
             self.bookmarks
-                .insert(abs_path.clone(), BookmarkEntry::Loaded(buffer_bookmarks));
+                .insert(abs_path.clone(), FileBookmarks::Active(active_bookmarks));
         }
     }
 
@@ -294,8 +294,8 @@ impl BookmarkStore {
             .bookmarks
             .iter()
             .filter_map(|(path, entry)| match entry {
-                BookmarkEntry::Unloaded(_) => Some(path.clone()),
-                BookmarkEntry::Loaded(_) => None,
+                FileBookmarks::Inactive(_) => Some(path.clone()),
+                FileBookmarks::Active(_) => None,
             })
             .collect();
 
@@ -423,38 +423,37 @@ impl BookmarkStore {
 
         self.resolve_anchors_if_needed(&abs_path, &buffer, cx);
 
-        let entry = self
-            .bookmarks
-            .entry(abs_path.clone())
-            .or_insert_with(|| BookmarkEntry::Loaded(BufferBookmarks::new(buffer.clone(), cx)));
+        let entry = self.bookmarks.entry(abs_path.clone()).or_insert_with(|| {
+            FileBookmarks::Active(ActiveBufferBookmarks::new(buffer.clone(), cx))
+        });
 
-        let BookmarkEntry::Loaded(buffer_bookmarks) = entry else {
+        let FileBookmarks::Active(buffer_bookmarks) = entry else {
             unreachable!("resolve_if_needed should have converted to Loaded");
         };
 
         let snapshot = buffer.read(cx).snapshot();
 
-        let existing_index = buffer_bookmarks.bookmarks.iter().position(|existing| {
+        let existing_index = buffer_bookmarks.anchors.iter().position(|existing| {
             existing.0.summary::<Point>(&snapshot).row == anchor.summary::<Point>(&snapshot).row
         });
 
         if let Some(index) = existing_index {
-            buffer_bookmarks.bookmarks.remove(index);
-            if buffer_bookmarks.bookmarks.is_empty() {
+            buffer_bookmarks.anchors.remove(index);
+            if buffer_bookmarks.anchors.is_empty() {
                 self.bookmarks.remove(&abs_path);
             }
         } else {
-            buffer_bookmarks.bookmarks.push(BookmarkAnchor(anchor));
+            buffer_bookmarks.anchors.push(BookmarkAnchor(anchor));
         }
 
         cx.notify();
     }
 
-    pub fn bookmarks(&self) -> &BTreeMap<Arc<Path>, BookmarkEntry> {
+    pub fn bookmarks(&self) -> &BTreeMap<Arc<Path>, FileBookmarks> {
         &self.bookmarks
     }
 
-    pub fn bookmarks_for_buffer(
+    pub fn bookmark_anchors_for_buffer(
         &mut self,
         buffer: Entity<Buffer>,
         range: Option<Range<text::Anchor>>,
@@ -467,28 +466,26 @@ impl BookmarkStore {
 
         self.resolve_anchors_if_needed(&abs_path, &buffer, cx);
 
-        let Some(BookmarkEntry::Loaded(file_bookmarks)) = self.bookmarks.get(&abs_path) else {
+        let Some(FileBookmarks::Active(buffer_bookmarks)) = self.bookmarks.get(&abs_path) else {
             return Vec::new();
         };
 
-        file_bookmarks
-            .bookmarks
+        buffer_bookmarks
+            .anchors
             .iter()
-            .filter_map({
-                move |bookmark| {
-                    if !buffer_snapshot.can_resolve(&bookmark.anchor()) {
-                        return None;
-                    }
-
-                    if let Some(range) = &range
-                        && (bookmark.anchor().cmp(&range.start, buffer_snapshot).is_lt()
-                            || bookmark.anchor().cmp(&range.end, buffer_snapshot).is_gt())
-                    {
-                        return None;
-                    }
-
-                    Some(*bookmark)
+            .filter_map(move |bookmark| {
+                if !buffer_snapshot.can_resolve(&bookmark.anchor()) {
+                    return None;
                 }
+
+                if let Some(range) = &range
+                    && (bookmark.anchor().cmp(&range.start, buffer_snapshot).is_lt()
+                        || bookmark.anchor().cmp(&range.end, buffer_snapshot).is_gt())
+                {
+                    return None;
+                }
+
+                Some(*bookmark)
             })
             .collect()
     }
@@ -502,10 +499,10 @@ impl BookmarkStore {
             .is_none_or(|f| f.disk_state().is_deleted())
         {
             self.bookmarks.retain(|_, entry| match entry {
-                BookmarkEntry::Loaded(buffer_bookmarks) => {
+                FileBookmarks::Active(buffer_bookmarks) => {
                     buffer_bookmarks.buffer.entity_id() != entity_id
                 }
-                BookmarkEntry::Unloaded(_) => true,
+                FileBookmarks::Inactive(_) => true,
             });
             cx.notify();
             return;
@@ -520,10 +517,10 @@ impl BookmarkStore {
                 .bookmarks
                 .iter()
                 .find(|(_, entry)| match entry {
-                    BookmarkEntry::Loaded(buffer_bookmarks) => {
+                    FileBookmarks::Active(buffer_bookmarks) => {
                         buffer_bookmarks.buffer.entity_id() == entity_id
                     }
-                    BookmarkEntry::Unloaded(_) => false,
+                    FileBookmarks::Inactive(_) => false,
                 })
                 .map(|(path, _)| path)
                 .cloned()
@@ -549,7 +546,7 @@ impl BookmarkStore {
             return;
         };
 
-        let Some(BookmarkEntry::Loaded(buffer_bookmarks)) = self.bookmarks.get_mut(&abs_path)
+        let Some(FileBookmarks::Active(buffer_bookmarks)) = self.bookmarks.get_mut(&abs_path)
         else {
             return;
         };
@@ -566,7 +563,7 @@ impl BookmarkStore {
         let outline_items: &[OutlineItem<Anchor>] = &outline.items;
 
         if outline_items.is_empty() {
-            if let Some(BookmarkEntry::Loaded(bookmark)) = self.bookmarks.get_mut(&abs_path) {
+            if let Some(FileBookmarks::Active(bookmark)) = self.bookmarks.get_mut(&abs_path) {
                 bookmark.pending = pending;
             }
             return;
@@ -589,9 +586,9 @@ impl BookmarkStore {
             let fallback_row = serialized.row;
             let new_anchor = snapshot.anchor_after(point);
 
-            if let Some(BookmarkEntry::Loaded(bookmark)) = self.bookmarks.get_mut(&abs_path) {
+            if let Some(FileBookmarks::Active(bookmark)) = self.bookmarks.get_mut(&abs_path) {
                 if let Some(existing) = bookmark
-                    .bookmarks
+                    .anchors
                     .iter_mut()
                     .find(|b| b.0.summary::<Point>(&text_snapshot).row == fallback_row)
                 {
@@ -611,11 +608,11 @@ impl BookmarkStore {
             .iter()
             .filter_map(|(path, entry)| {
                 let mut serialized = match entry {
-                    BookmarkEntry::Unloaded(bookmarks) => bookmarks.clone(),
-                    BookmarkEntry::Loaded(buffer_bookmarks) => {
+                    FileBookmarks::Inactive(bookmarks) => bookmarks.clone(),
+                    FileBookmarks::Active(buffer_bookmarks) => {
                         let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
                         buffer_bookmarks
-                            .bookmarks
+                            .anchors
                             .iter()
                             .filter_map(|bookmark| {
                                 if !snapshot.can_resolve(&bookmark.anchor()) {
@@ -653,7 +650,7 @@ impl BookmarkStore {
         let mut locations: HashMap<Entity<Buffer>, Vec<Range<Point>>> = HashMap::default();
 
         for (_, entry) in &self.bookmarks {
-            let BookmarkEntry::Loaded(buffer_bookmarks) = entry else {
+            let FileBookmarks::Active(buffer_bookmarks) = entry else {
                 continue;
             };
             let buffer = buffer_bookmarks.buffer().clone();

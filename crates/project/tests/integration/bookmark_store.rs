@@ -365,7 +365,7 @@ mod integration {
         project.update(cx, |project, cx| {
             let buffer_snapshot = buffer.read(cx).snapshot();
             project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &buffer_snapshot, cx);
+                store.bookmark_anchors_for_buffer(buffer.clone(), None, &buffer_snapshot, cx);
             });
         });
 
@@ -424,7 +424,7 @@ mod integration {
         project.update(cx, |project, cx| {
             let buffer_snapshot = buffer.read(cx).snapshot();
             project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &buffer_snapshot, cx);
+                store.bookmark_anchors_for_buffer(buffer.clone(), None, &buffer_snapshot, cx);
             });
         });
 
@@ -740,7 +740,7 @@ mod integration {
         project.update(cx, |project, cx| {
             let snapshot = buffer.read(cx).snapshot();
             project.bookmark_store().update(cx, |store, cx| {
-                store.bookmarks_for_buffer(buffer.clone(), None, &snapshot, cx);
+                store.bookmark_anchors_for_buffer(buffer.clone(), None, &snapshot, cx);
             });
         });
     }

@@ -8936,7 +8936,7 @@ impl Editor {
                 continue;
             };
             let bookmarks = bookmark_store.update(cx, |store, cx| {
-                store.bookmarks_for_buffer(
+                store.bookmark_anchors_for_buffer(
                     buffer,
                     Some(
                         buffer_snapshot.anchor_before(range.start)
@@ -12291,7 +12291,7 @@ impl Editor {
                         };
                         bookmark_store
                             .update(cx, |store, cx| {
-                                store.bookmarks_for_buffer(
+                                store.bookmark_anchors_for_buffer(
                                     buffer,
                                     Some(
                                         buffer_snapshot.anchor_before(buffer_range.start)
