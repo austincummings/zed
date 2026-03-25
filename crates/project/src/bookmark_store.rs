@@ -21,20 +21,11 @@ impl BookmarkAnchor {
     }
 }
 
-/// A bookmark serialized with optional syntactic context for cross-session stability.
-/// When a symbol_path is present, restoration will attempt to locate the matching
-/// syntactic construct first, falling back to the raw row number if not found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SerializedBookmark {
-    /// The row number at time of serialization (fallback anchor).
     pub row: u32,
-    /// Hierarchical path of enclosing outline symbol names, from outermost to innermost.
-    /// e.g. `["impl DataProcessor", "fn process"]`
     pub symbol_path: Option<Vec<String>>,
-    /// Row offset of the bookmark relative to the start of the innermost symbol.
     pub offset_in_symbol: Option<u32>,
-    /// First 30 characters of the bookmarked line, used to disambiguate when
-    /// multiple outline sections share the same symbol path.
     pub context_snippet: Option<String>,
 }
 
@@ -42,9 +33,8 @@ pub struct SerializedBookmark {
 pub struct BufferBookmarks {
     buffer: Entity<Buffer>,
     bookmarks: Vec<BookmarkAnchor>,
-    /// Serialized bookmarks with syntactic context waiting for tree-sitter
-    /// to finish parsing so that outline-based resolution can be attempted.
-    pending_syntactic: Vec<SerializedBookmark>,
+    pending: Vec<SerializedBookmark>,
+
     _subscription: Subscription,
 }
 
@@ -66,7 +56,7 @@ impl BufferBookmarks {
         Self {
             buffer,
             bookmarks: Vec::new(),
-            pending_syntactic: Vec::new(),
+            pending: Vec::new(),
             _subscription: subscription,
         }
     }
@@ -155,9 +145,7 @@ impl BookmarkStore {
             .any(|b| b.symbol_path.as_ref().is_some_and(|p| !p.is_empty()));
         let outline_is_empty = outline_items.is_empty();
 
-        // Collect bookmarks that have syntactic context but can't be resolved
-        // yet because the outline is empty (tree-sitter hasn't parsed yet).
-        let mut pending_syntactic = Vec::new();
+        let mut pending = Vec::new();
 
         let anchors: Vec<BookmarkAnchor> = serialized
             .iter()
@@ -174,9 +162,8 @@ impl BookmarkStore {
                         return Some(BookmarkAnchor(anchor));
                     }
                 } else if bookmark.symbol_path.as_ref().is_some_and(|p| !p.is_empty()) {
-                    // Outline not available yet; save for deferred resolution
-                    // after tree-sitter parses.
-                    pending_syntactic.push(bookmark.clone());
+                    // Outline not available yet, save for deferred resolution after tree-sitter parses.
+                    pending.push(bookmark.clone());
                 }
 
                 let point = Point::new(bookmark.row, 0);
@@ -195,21 +182,19 @@ impl BookmarkStore {
             })
             .collect();
 
-        if anchors.is_empty() && pending_syntactic.is_empty() {
+        if anchors.is_empty() && pending.is_empty() {
             self.bookmarks.remove(abs_path);
         } else {
             let mut buffer_bookmarks = BufferBookmarks::new(buffer.clone(), cx);
             buffer_bookmarks.bookmarks = anchors;
             if has_syntactic_bookmarks && outline_is_empty {
-                buffer_bookmarks.pending_syntactic = pending_syntactic;
+                buffer_bookmarks.pending = pending;
             }
             self.bookmarks
                 .insert(abs_path.clone(), BookmarkEntry::Loaded(buffer_bookmarks));
         }
     }
 
-    /// Attempt to resolve a bookmark using its syntactic context.
-    /// Returns the resolved row if a matching outline symbol is found.
     fn resolve_syntactic_bookmark(
         bookmark: &SerializedBookmark,
         outline_items: &[OutlineItem<Anchor>],
@@ -222,8 +207,6 @@ impl BookmarkStore {
 
         let innermost_name = symbol_path.last()?;
 
-        // Find candidate items whose text matches the innermost symbol name,
-        // collecting all full path matches to allow snippet-based disambiguation.
         let mut full_matches: Vec<(usize, &OutlineItem<Anchor>)> = Vec::new();
 
         for (index, item) in outline_items.iter().enumerate() {
@@ -236,8 +219,6 @@ impl BookmarkStore {
             }
         }
 
-        // When multiple outline sections share the same symbol path, use the
-        // context snippet to pick the right one.
         let best_match = if full_matches.len() > 1 {
             if let Some(snippet) = bookmark.context_snippet.as_deref() {
                 full_matches
@@ -262,7 +243,6 @@ impl BookmarkStore {
             full_matches.first().copied()
         };
 
-        // If exact match failed, try matching just the innermost name.
         let matched_item = best_match.map(|(_, item)| item).or_else(|| {
             outline_items
                 .iter()
@@ -280,7 +260,6 @@ impl BookmarkStore {
         Some(resolved_row)
     }
 
-    /// Check whether the ancestor chain of an outline item matches the given symbol path.
     fn matches_symbol_path(
         symbol_path: &[String],
         item_index: usize,
@@ -292,7 +271,6 @@ impl BookmarkStore {
 
         let target_depth = outline_items[item_index].depth;
 
-        // Walk backwards through the symbol path, matching ancestors.
         let mut remaining_path: &[String] = &symbol_path[..symbol_path.len() - 1];
         let mut current_depth = target_depth;
 
@@ -311,7 +289,6 @@ impl BookmarkStore {
         remaining_path.is_empty()
     }
 
-    /// Opens buffers for all unloaded bookmark entries and resolves them to anchors.
     pub fn resolve_all(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let unloaded_paths: Vec<Arc<Path>> = self
             .bookmarks
@@ -392,8 +369,6 @@ impl BookmarkStore {
             .map(Arc::<Path>::from)
     }
 
-    /// Compute the syntactic context for a bookmark at the given position.
-    /// Returns the symbol path and offset within the innermost symbol.
     pub fn compute_syntactic_context(
         snapshot: &language::BufferSnapshot,
         row: u32,
@@ -414,9 +389,6 @@ impl BookmarkStore {
 
     const CONTEXT_SNIPPET_MAX_LEN: usize = 30;
 
-    /// Extract the first 30 characters of text at the given row, trimmed of
-    /// leading/trailing whitespace. Used to disambiguate bookmarks in duplicate
-    /// outline sections that share the same symbol path.
     pub fn compute_context_snippet(
         snapshot: &language::BufferSnapshot,
         row: u32,
@@ -439,9 +411,6 @@ impl BookmarkStore {
         Some(clipped)
     }
 
-    /// Toggle a bookmark at the given anchor in the buffer.
-    /// If a bookmark already exists on the same row, it will be removed.
-    /// Otherwise, a new bookmark will be added.
     pub fn toggle_bookmark(
         &mut self,
         buffer: Entity<Buffer>,
@@ -485,9 +454,6 @@ impl BookmarkStore {
         &self.bookmarks
     }
 
-    /// Returns the bookmarks for a given buffer within an optional range.
-    /// Only returns bookmarks that have been resolved to anchors (loaded).
-    /// Unloaded bookmarks for the given buffer will be resolved first.
     pub fn bookmarks_for_buffer(
         &mut self,
         buffer: Entity<Buffer>,
@@ -574,9 +540,6 @@ impl BookmarkStore {
         }
     }
 
-    /// Called when a buffer finishes tree-sitter parsing. Re-resolves any
-    /// bookmarks that were placed at fallback row positions because the outline
-    /// was not yet available.
     fn resolve_pending_syntactic_bookmarks(
         &mut self,
         buffer: Entity<Buffer>,
@@ -591,11 +554,11 @@ impl BookmarkStore {
             return;
         };
 
-        if buffer_bookmarks.pending_syntactic.is_empty() {
+        if buffer_bookmarks.pending.is_empty() {
             return;
         }
 
-        let pending = std::mem::take(&mut buffer_bookmarks.pending_syntactic);
+        let pending = std::mem::take(&mut buffer_bookmarks.pending);
 
         let snapshot = buffer.read(cx).snapshot();
         let max_point = snapshot.max_point();
@@ -603,9 +566,8 @@ impl BookmarkStore {
         let outline_items: &[OutlineItem<Anchor>] = &outline.items;
 
         if outline_items.is_empty() {
-            // Still no outline — put them back for the next reparse.
-            if let Some(BookmarkEntry::Loaded(bm)) = self.bookmarks.get_mut(&abs_path) {
-                bm.pending_syntactic = pending;
+            if let Some(BookmarkEntry::Loaded(bookmark)) = self.bookmarks.get_mut(&abs_path) {
+                bookmark.pending = pending;
             }
             return;
         }
@@ -624,13 +586,11 @@ impl BookmarkStore {
                 continue;
             }
 
-            // Find the existing bookmark that was placed at the fallback row
-            // and move it to the syntactically-resolved position.
             let fallback_row = serialized.row;
             let new_anchor = snapshot.anchor_after(point);
 
-            if let Some(BookmarkEntry::Loaded(bm)) = self.bookmarks.get_mut(&abs_path) {
-                if let Some(existing) = bm
+            if let Some(BookmarkEntry::Loaded(bookmark)) = self.bookmarks.get_mut(&abs_path) {
+                if let Some(existing) = bookmark
                     .bookmarks
                     .iter_mut()
                     .find(|b| b.0.summary::<Point>(&text_snapshot).row == fallback_row)

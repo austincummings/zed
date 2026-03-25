@@ -528,7 +528,6 @@ mod integration {
         let serialized = get_all_bookmarks(&project, cx);
         assert_bookmark_rows(&serialized, path!("/project/file.rs"), &[2, 4]);
 
-        // Clear and restore
         clear_bookmarks(&project, cx);
         restore_bookmarks(&project, serialized, cx).await;
 
@@ -559,7 +558,6 @@ mod integration {
         add_bookmarks(&project, &buffer2, &[1], cx);
         assert_eq!(get_all_bookmarks(&project, cx).len(), 2);
 
-        // Delete file1.rs
         fs.remove_file(path!("/project/file1.rs").as_ref(), Default::default())
             .await
             .unwrap();
