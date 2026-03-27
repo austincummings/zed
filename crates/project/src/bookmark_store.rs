@@ -364,6 +364,7 @@ impl BookmarkStore {
         (Some(symbol_path), Some(offset))
     }
 
+    // TODO: Can we refactor this so that it returns anchors and doesn't modify the bookmark store?
     fn resolve_anchors_if_needed(
         &mut self,
         abs_path: &Arc<Path>,
