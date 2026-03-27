@@ -100,7 +100,7 @@ impl BookmarkStore {
         }
     }
 
-    pub fn with_serialized_bookmarks(
+    pub fn load_serialized_bookmarks(
         &mut self,
         bookmarks: BTreeMap<Arc<Path>, Vec<SerializedBookmark>>,
         cx: &mut Context<Self>,
