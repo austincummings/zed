@@ -6463,14 +6463,11 @@ impl Workspace {
                 cx.notify();
             })?;
 
-            project
-                .update(cx, |project, cx| {
-                    project.bookmark_store().update(cx, |bookmark_store, cx| {
-                        bookmark_store.load_serialized_bookmarks(serialized_workspace.bookmarks, cx)
-                    })
+            project.update(cx, |project, cx| {
+                project.bookmark_store().update(cx, |bookmark_store, cx| {
+                    bookmark_store.load_serialized_bookmarks(serialized_workspace.bookmarks, cx);
                 })
-                .await
-                .log_err();
+            });
 
             let _ = project
                 .update(cx, |project, cx| {

@@ -104,7 +104,7 @@ impl BookmarkStore {
         &mut self,
         bookmarks: BTreeMap<Arc<Path>, Vec<SerializedBookmark>>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) {
         self.bookmarks.clear();
 
         for (path, serialized) in bookmarks {
@@ -121,7 +121,6 @@ impl BookmarkStore {
         }
 
         cx.notify();
-        Task::ready(Ok(()))
     }
 
     pub fn toggle_bookmark(
