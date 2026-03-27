@@ -124,6 +124,247 @@ impl BookmarkStore {
         Task::ready(Ok(()))
     }
 
+    pub fn toggle_bookmark(
+        &mut self,
+        buffer: Entity<Buffer>,
+        anchor: text::Anchor,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
+            return;
+        };
+
+        self.resolve_anchors_if_needed(&abs_path, &buffer, cx);
+
+        let entry = self.bookmarks.entry(abs_path.clone()).or_insert_with(|| {
+            FileBookmarks::Active(ActiveBufferBookmarks::new(buffer.clone(), cx))
+        });
+
+        let FileBookmarks::Active(buffer_bookmarks) = entry else {
+            unreachable!("resolve_if_needed should have converted to Loaded");
+        };
+
+        let snapshot = buffer.read(cx).snapshot();
+
+        let existing_index = buffer_bookmarks.anchors.iter().position(|existing| {
+            existing.0.summary::<Point>(&snapshot).row == anchor.summary::<Point>(&snapshot).row
+        });
+
+        if let Some(index) = existing_index {
+            buffer_bookmarks.anchors.remove(index);
+            if buffer_bookmarks.anchors.is_empty() {
+                self.bookmarks.remove(&abs_path);
+            }
+        } else {
+            buffer_bookmarks.anchors.push(BookmarkAnchor(anchor));
+        }
+
+        cx.notify();
+    }
+
+    pub fn all_serialized_bookmarks(
+        &self,
+        cx: &App,
+    ) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
+        self.bookmarks
+            .iter()
+            .filter_map(|(path, entry)| {
+                let mut serialized = match entry {
+                    FileBookmarks::Inactive(bookmarks) => bookmarks.clone(),
+                    FileBookmarks::Active(buffer_bookmarks) => {
+                        let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
+                        buffer_bookmarks
+                            .anchors
+                            .iter()
+                            .filter_map(|bookmark| {
+                                if !snapshot.can_resolve(&bookmark.anchor()) {
+                                    return None;
+                                }
+                                let row =
+                                    snapshot.summary_for_anchor::<Point>(&bookmark.anchor()).row;
+                                let (symbol_path, offset_in_symbol) =
+                                    Self::compute_syntactic_context(&snapshot, row);
+                                let context_snippet = Self::compute_context_snippet(&snapshot, row);
+                                Some(SerializedBookmark {
+                                    row,
+                                    symbol_path,
+                                    offset_in_symbol,
+                                    context_snippet,
+                                })
+                            })
+                            .collect()
+                    }
+                };
+
+                serialized.sort_by_key(|b| b.row);
+                serialized.dedup_by_key(|b| b.row);
+
+                if serialized.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), serialized))
+                }
+            })
+            .collect()
+    }
+
+    pub fn bookmark_anchors_for_buffer(
+        &mut self,
+        buffer: Entity<Buffer>,
+        range: Option<Range<text::Anchor>>,
+        buffer_snapshot: &BufferSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<BookmarkAnchor> {
+        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
+            return Vec::new();
+        };
+
+        self.resolve_anchors_if_needed(&abs_path, &buffer, cx);
+
+        let Some(FileBookmarks::Active(buffer_bookmarks)) = self.bookmarks.get(&abs_path) else {
+            return Vec::new();
+        };
+
+        buffer_bookmarks
+            .anchors
+            .iter()
+            .filter_map(move |bookmark| {
+                if !buffer_snapshot.can_resolve(&bookmark.anchor()) {
+                    return None;
+                }
+
+                if let Some(range) = &range
+                    && (bookmark.anchor().cmp(&range.start, buffer_snapshot).is_lt()
+                        || bookmark.anchor().cmp(&range.end, buffer_snapshot).is_gt())
+                {
+                    return None;
+                }
+
+                Some(*bookmark)
+            })
+            .collect()
+    }
+
+    pub fn all_bookmark_locations(&self, cx: &App) -> HashMap<Entity<Buffer>, Vec<Range<Point>>> {
+        let mut locations: HashMap<Entity<Buffer>, Vec<Range<Point>>> = HashMap::default();
+
+        for (_, entry) in &self.bookmarks {
+            let FileBookmarks::Active(buffer_bookmarks) = entry else {
+                continue;
+            };
+            let buffer = buffer_bookmarks.buffer().clone();
+            let snapshot = buffer.read(cx).snapshot();
+            let ranges: Vec<Range<Point>> = buffer_bookmarks
+                .bookmarks()
+                .iter()
+                .map(|anchor| {
+                    let row = snapshot.summary_for_anchor::<Point>(&anchor.anchor()).row;
+                    Point::row_range(row..row)
+                })
+                .collect();
+            locations.entry(buffer).or_default().extend(ranges);
+        }
+
+        locations
+    }
+
+    pub fn resolve_all(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let unloaded_paths: Vec<Arc<Path>> = self
+            .bookmarks
+            .iter()
+            .filter_map(|(path, entry)| match entry {
+                FileBookmarks::Inactive(_) => Some(path.clone()),
+                FileBookmarks::Active(_) => None,
+            })
+            .collect();
+
+        if unloaded_paths.is_empty() {
+            return Task::ready(Ok(()));
+        }
+
+        let worktree_store = self.worktree_store.downgrade();
+        let buffer_store = self.buffer_store.downgrade();
+
+        cx.spawn(async move |this, cx| {
+            let open_tasks: Vec<_> = unloaded_paths
+                .into_iter()
+                .map(|path| {
+                    let worktree_store = worktree_store.clone();
+                    let buffer_store = buffer_store.clone();
+                    let mut cx = cx.clone();
+                    async move {
+                        let result: Result<Entity<Buffer>> = async {
+                            let (worktree, relative_path) = worktree_store
+                                .update(&mut cx, |worktree_store, cx| {
+                                    worktree_store.find_or_create_worktree(&path, false, cx)
+                                })?
+                                .await?;
+
+                            let buffer = buffer_store
+                                .update(&mut cx, |buffer_store, cx| {
+                                    let project_path = ProjectPath {
+                                        worktree_id: worktree.read(cx).id(),
+                                        path: relative_path,
+                                    };
+                                    buffer_store.open_buffer(project_path, cx)
+                                })?
+                                .await?;
+
+                            Ok(buffer)
+                        }
+                        .await;
+
+                        (path, result)
+                    }
+                })
+                .collect();
+
+            let results = futures::future::join_all(open_tasks).await;
+
+            this.update(cx, |this, cx| {
+                for (path, result) in results {
+                    match result {
+                        Ok(buffer) => {
+                            this.resolve_anchors_if_needed(&path, &buffer, cx);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Could not open buffer for bookmarked path {}: {error}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+                cx.notify();
+            })?;
+
+            Ok(())
+        })
+    }
+
+    pub fn clear_bookmarks(&mut self, cx: &mut Context<Self>) {
+        self.bookmarks.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn compute_syntactic_context(
+        snapshot: &language::BufferSnapshot,
+        row: u32,
+    ) -> (Option<Vec<String>>, Option<u32>) {
+        let symbols = snapshot.symbols_containing(Point::new(row, 0), None);
+        if symbols.is_empty() {
+            return (None, None);
+        }
+
+        let symbol_path: Vec<String> = symbols.iter().map(|item| item.text.clone()).collect();
+
+        let innermost = &symbols[symbols.len() - 1];
+        let item_start_row = innermost.range.start.to_point(snapshot).row;
+        let offset = row.saturating_sub(item_start_row);
+
+        (Some(symbol_path), Some(offset))
+    }
+
     fn resolve_anchors_if_needed(
         &mut self,
         abs_path: &Arc<Path>,
@@ -289,110 +530,15 @@ impl BookmarkStore {
         remaining_path.is_empty()
     }
 
-    pub fn resolve_all(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let unloaded_paths: Vec<Arc<Path>> = self
-            .bookmarks
-            .iter()
-            .filter_map(|(path, entry)| match entry {
-                FileBookmarks::Inactive(_) => Some(path.clone()),
-                FileBookmarks::Active(_) => None,
-            })
-            .collect();
-
-        if unloaded_paths.is_empty() {
-            return Task::ready(Ok(()));
-        }
-
-        let worktree_store = self.worktree_store.downgrade();
-        let buffer_store = self.buffer_store.downgrade();
-
-        cx.spawn(async move |this, cx| {
-            let open_tasks: Vec<_> = unloaded_paths
-                .into_iter()
-                .map(|path| {
-                    let worktree_store = worktree_store.clone();
-                    let buffer_store = buffer_store.clone();
-                    let mut cx = cx.clone();
-                    async move {
-                        let result: Result<Entity<Buffer>> = async {
-                            let (worktree, relative_path) = worktree_store
-                                .update(&mut cx, |worktree_store, cx| {
-                                    worktree_store.find_or_create_worktree(&path, false, cx)
-                                })?
-                                .await?;
-
-                            let buffer = buffer_store
-                                .update(&mut cx, |buffer_store, cx| {
-                                    let project_path = ProjectPath {
-                                        worktree_id: worktree.read(cx).id(),
-                                        path: relative_path,
-                                    };
-                                    buffer_store.open_buffer(project_path, cx)
-                                })?
-                                .await?;
-
-                            Ok(buffer)
-                        }
-                        .await;
-
-                        (path, result)
-                    }
-                })
-                .collect();
-
-            let results = futures::future::join_all(open_tasks).await;
-
-            this.update(cx, |this, cx| {
-                for (path, result) in results {
-                    match result {
-                        Ok(buffer) => {
-                            this.resolve_anchors_if_needed(&path, &buffer, cx);
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "Could not open buffer for bookmarked path {}: {error}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
-                cx.notify();
-            })?;
-
-            Ok(())
-        })
-    }
-
-    pub fn abs_path_from_buffer(buffer: &Entity<Buffer>, cx: &App) -> Option<Arc<Path>> {
+    fn abs_path_from_buffer(buffer: &Entity<Buffer>, cx: &App) -> Option<Arc<Path>> {
         worktree::File::from_dyn(buffer.read(cx).file())
             .map(|file| file.worktree.read(cx).absolutize(&file.path))
             .map(Arc::<Path>::from)
     }
 
-    pub fn compute_syntactic_context(
-        snapshot: &language::BufferSnapshot,
-        row: u32,
-    ) -> (Option<Vec<String>>, Option<u32>) {
-        let symbols = snapshot.symbols_containing(Point::new(row, 0), None);
-        if symbols.is_empty() {
-            return (None, None);
-        }
-
-        let symbol_path: Vec<String> = symbols.iter().map(|item| item.text.clone()).collect();
-
-        let innermost = &symbols[symbols.len() - 1];
-        let item_start_row = innermost.range.start.to_point(snapshot).row;
-        let offset = row.saturating_sub(item_start_row);
-
-        (Some(symbol_path), Some(offset))
-    }
-
     const CONTEXT_SNIPPET_MAX_LEN: usize = 30;
 
-    pub fn compute_context_snippet(
-        snapshot: &language::BufferSnapshot,
-        row: u32,
-    ) -> Option<String> {
+    fn compute_context_snippet(snapshot: &language::BufferSnapshot, row: u32) -> Option<String> {
         let max_row = snapshot.max_point().row;
         if row > max_row {
             return None;
@@ -409,85 +555,6 @@ impl BookmarkStore {
             .take(Self::CONTEXT_SNIPPET_MAX_LEN)
             .collect();
         Some(clipped)
-    }
-
-    pub fn toggle_bookmark(
-        &mut self,
-        buffer: Entity<Buffer>,
-        anchor: text::Anchor,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
-            return;
-        };
-
-        self.resolve_anchors_if_needed(&abs_path, &buffer, cx);
-
-        let entry = self.bookmarks.entry(abs_path.clone()).or_insert_with(|| {
-            FileBookmarks::Active(ActiveBufferBookmarks::new(buffer.clone(), cx))
-        });
-
-        let FileBookmarks::Active(buffer_bookmarks) = entry else {
-            unreachable!("resolve_if_needed should have converted to Loaded");
-        };
-
-        let snapshot = buffer.read(cx).snapshot();
-
-        let existing_index = buffer_bookmarks.anchors.iter().position(|existing| {
-            existing.0.summary::<Point>(&snapshot).row == anchor.summary::<Point>(&snapshot).row
-        });
-
-        if let Some(index) = existing_index {
-            buffer_bookmarks.anchors.remove(index);
-            if buffer_bookmarks.anchors.is_empty() {
-                self.bookmarks.remove(&abs_path);
-            }
-        } else {
-            buffer_bookmarks.anchors.push(BookmarkAnchor(anchor));
-        }
-
-        cx.notify();
-    }
-
-    pub fn bookmarks(&self) -> &BTreeMap<Arc<Path>, FileBookmarks> {
-        &self.bookmarks
-    }
-
-    pub fn bookmark_anchors_for_buffer(
-        &mut self,
-        buffer: Entity<Buffer>,
-        range: Option<Range<text::Anchor>>,
-        buffer_snapshot: &BufferSnapshot,
-        cx: &mut Context<Self>,
-    ) -> Vec<BookmarkAnchor> {
-        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
-            return Vec::new();
-        };
-
-        self.resolve_anchors_if_needed(&abs_path, &buffer, cx);
-
-        let Some(FileBookmarks::Active(buffer_bookmarks)) = self.bookmarks.get(&abs_path) else {
-            return Vec::new();
-        };
-
-        buffer_bookmarks
-            .anchors
-            .iter()
-            .filter_map(move |bookmark| {
-                if !buffer_snapshot.can_resolve(&bookmark.anchor()) {
-                    return None;
-                }
-
-                if let Some(range) = &range
-                    && (bookmark.anchor().cmp(&range.start, buffer_snapshot).is_lt()
-                        || bookmark.anchor().cmp(&range.end, buffer_snapshot).is_gt())
-                {
-                    return None;
-                }
-
-                Some(*bookmark)
-            })
-            .collect()
     }
 
     fn handle_file_changed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -597,80 +664,6 @@ impl BookmarkStore {
             }
         }
 
-        cx.notify();
-    }
-
-    pub fn all_serialized_bookmarks(
-        &self,
-        cx: &App,
-    ) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
-        self.bookmarks
-            .iter()
-            .filter_map(|(path, entry)| {
-                let mut serialized = match entry {
-                    FileBookmarks::Inactive(bookmarks) => bookmarks.clone(),
-                    FileBookmarks::Active(buffer_bookmarks) => {
-                        let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
-                        buffer_bookmarks
-                            .anchors
-                            .iter()
-                            .filter_map(|bookmark| {
-                                if !snapshot.can_resolve(&bookmark.anchor()) {
-                                    return None;
-                                }
-                                let row =
-                                    snapshot.summary_for_anchor::<Point>(&bookmark.anchor()).row;
-                                let (symbol_path, offset_in_symbol) =
-                                    Self::compute_syntactic_context(&snapshot, row);
-                                let context_snippet = Self::compute_context_snippet(&snapshot, row);
-                                Some(SerializedBookmark {
-                                    row,
-                                    symbol_path,
-                                    offset_in_symbol,
-                                    context_snippet,
-                                })
-                            })
-                            .collect()
-                    }
-                };
-
-                serialized.sort_by_key(|b| b.row);
-                serialized.dedup_by_key(|b| b.row);
-
-                if serialized.is_empty() {
-                    None
-                } else {
-                    Some((path.clone(), serialized))
-                }
-            })
-            .collect()
-    }
-
-    pub fn all_bookmark_locations(&self, cx: &App) -> HashMap<Entity<Buffer>, Vec<Range<Point>>> {
-        let mut locations: HashMap<Entity<Buffer>, Vec<Range<Point>>> = HashMap::default();
-
-        for (_, entry) in &self.bookmarks {
-            let FileBookmarks::Active(buffer_bookmarks) = entry else {
-                continue;
-            };
-            let buffer = buffer_bookmarks.buffer().clone();
-            let snapshot = buffer.read(cx).snapshot();
-            let ranges: Vec<Range<Point>> = buffer_bookmarks
-                .bookmarks()
-                .iter()
-                .map(|anchor| {
-                    let row = snapshot.summary_for_anchor::<Point>(&anchor.anchor()).row;
-                    Point::row_range(row..row)
-                })
-                .collect();
-            locations.entry(buffer).or_default().extend(ranges);
-        }
-
-        locations
-    }
-
-    pub fn clear_bookmarks(&mut self, cx: &mut Context<Self>) {
-        self.bookmarks.clear();
         cx.notify();
     }
 }
