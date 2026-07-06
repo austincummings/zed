@@ -3,8 +3,9 @@ use crate::{
     CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
     FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
     ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
+    RenameTool, RuntimeToolRegistry, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate,
+    Template, Templates, TerminalTool, ToolPermissionDecision, ToolSource, WebSearchTool,
+    WriteFileTool,
     decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
@@ -1244,6 +1245,9 @@ pub struct Thread {
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
+    /// Source 3: tools registered at runtime (in-process +, later, extensions).
+    /// Shared per-project via [`ProjectState`], inherited by subagents.
+    pub(crate) runtime_tool_registry: Entity<RuntimeToolRegistry>,
     profile_id: AgentProfileId,
     /// Whether `profile_id` was downgraded to `minimal` at thread start because
     /// the workspace is restricted. Used purely to surface a warning in the UI.
@@ -1287,6 +1291,7 @@ impl Thread {
         let project = parent_thread.read(cx).project.clone();
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
+        let runtime_tool_registry = parent_thread.read(cx).runtime_tool_registry.clone();
         let templates = parent_thread.read(cx).templates.clone();
         let model = parent_thread.read(cx).model().cloned();
         let parent_action_log = parent_thread.read(cx).action_log().clone();
@@ -1301,6 +1306,8 @@ impl Thread {
             action_log,
             cx,
         );
+        // Subagents share the parent's runtime tool registry.
+        thread.runtime_tool_registry = runtime_tool_registry;
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
@@ -1389,6 +1396,7 @@ impl Thread {
                     .shared()
             },
             context_server_registry,
+            runtime_tool_registry: cx.new(|_| RuntimeToolRegistry::new()),
             profile_id,
             profile_downgraded_for_restricted_workspace,
             project_context,
@@ -1570,18 +1578,29 @@ impl Thread {
         // `SandboxedTerminalTool`. That's safe because both variants share the
         // same `replay` behavior; replay only reconstructs UI state and never
         // re-runs the command or re-applies sandbox policy.
-        let tool = self.tools.get(tool_use.name.as_ref()).cloned().or_else(|| {
-            self.context_server_registry
-                .read(cx)
-                .servers()
-                .find_map(|(_, tools)| {
-                    if let Some(tool) = tools.get(tool_use.name.as_ref()) {
-                        Some(tool.clone())
-                    } else {
-                        None
-                    }
-                })
-        });
+        let tool = self
+            .tools
+            .get(tool_use.name.as_ref())
+            .cloned()
+            .or_else(|| {
+                self.context_server_registry
+                    .read(cx)
+                    .servers()
+                    .find_map(|(_, tools)| {
+                        if let Some(tool) = tools.get(tool_use.name.as_ref()) {
+                            Some(tool.clone())
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .or_else(|| {
+                // Source 3: runtime-registered tools.
+                self.runtime_tool_registry
+                    .read(cx)
+                    .get(tool_use.name.as_ref())
+                    .cloned()
+            });
 
         let Some(tool) = tool else {
             // Tool not found (e.g., MCP server not connected after restart),
@@ -1767,6 +1786,7 @@ impl Thread {
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
+            runtime_tool_registry: cx.new(|_| RuntimeToolRegistry::new()),
             profile_id,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
@@ -2186,6 +2206,34 @@ impl Thread {
             T::NAME,
         );
         self.tools.insert(T::NAME.into(), tool.erase());
+    }
+
+    /// Register a tool at runtime (Layer 1, in-process). It becomes available
+    /// to the model on the next turn — and mid-turn once a registry-change
+    /// subscription is wired (follow-up). The WASM extension path (Layer 2)
+    /// calls this same method with [`ToolSource::Extension`].
+    ///
+    /// Returns the model-facing name the tool registered under.
+    pub fn register_runtime_tool(
+        &self,
+        tool: Arc<dyn AnyAgentTool>,
+        source: ToolSource,
+        cx: &mut App,
+    ) -> SharedString {
+        self.runtime_tool_registry
+            .update(cx, |registry, cx| registry.register(tool, source, cx))
+    }
+
+    /// Unregister a runtime tool by name. Returns whether one was removed.
+    pub fn unregister_runtime_tool(&self, name: &str, cx: &mut App) -> bool {
+        self.runtime_tool_registry
+            .update(cx, |registry, cx| registry.unregister(name, cx))
+    }
+
+    /// The shared runtime tool registry for this thread's project. The
+    /// extension host / SDK layer registers into this (Layer 2).
+    pub fn runtime_tool_registry(&self) -> &Entity<RuntimeToolRegistry> {
+        &self.runtime_tool_registry
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4076,6 +4124,37 @@ impl Thread {
             } else {
                 tools.insert(tool_name, tool.clone());
             }
+        }
+
+        // Source 3: runtime-registered tools (in-process +, later, extensions).
+        // Unlike built-ins, these default to enabled (an unlisted tool would be
+        // disabled by `is_tool_enabled`); a profile may still opt one out by
+        // name. A runtime tool never overrides a built-in or MCP tool of the
+        // same model-facing name — the first source registered wins.
+        for (tool_name, tool) in self.runtime_tool_registry.read(cx).tools() {
+            if is_restricted && !tool.allow_in_restricted_mode() {
+                continue;
+            }
+            if !tool.supports_provider(&model.provider_id()) {
+                continue;
+            }
+            if !profile
+                .tools
+                .get(tool_name.as_ref())
+                .copied()
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let model_facing: SharedString =
+                provider_compatible_tool_name(tool_name.as_ref()).into();
+            if tools.contains_key(&model_facing) {
+                log::debug!(
+                    "Runtime tool `{model_facing}` shadowed by an existing built-in/MCP tool; skipping"
+                );
+                continue;
+            }
+            tools.insert(model_facing, tool.clone());
         }
 
         tools
@@ -6553,7 +6632,6 @@ mod tests {
             let context_server_store = project.read(cx).context_server_store();
             let context_server_registry =
                 cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
-
             let thread = cx.new(|cx| {
                 Thread::new(
                     project,

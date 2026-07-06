@@ -196,6 +196,7 @@ struct ProjectState {
     project_context_needs_refresh: watch::Sender<()>,
     _maintain_project_context: Task<Result<()>>,
     context_server_registry: Entity<ContextServerRegistry>,
+    runtime_tool_registry: Entity<RuntimeToolRegistry>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -734,14 +735,17 @@ impl NativeAgent {
                 .model_from_id(&LanguageModels::model_id(&default_model.model))
         });
         let thread = cx.new(|cx| {
-            Thread::new(
+            let mut thread = Thread::new(
                 project,
                 project_state.project_context.clone(),
                 project_state.context_server_registry.clone(),
                 self.templates.clone(),
                 default_model,
                 cx,
-            )
+            );
+            // Share the per-project runtime tool registry (Source 3).
+            thread.runtime_tool_registry = project_state.runtime_tool_registry.clone();
+            thread
         });
 
         self.register_session(thread, project_id, 1, cx)
@@ -868,6 +872,7 @@ impl NativeAgent {
         let context_server_store = project.read(cx).context_server_store();
         let context_server_registry =
             cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+        let runtime_tool_registry = cx.new(|_| RuntimeToolRegistry::new());
 
         let mut subscriptions = vec![
             cx.subscribe(&project, Self::handle_project_event),
@@ -917,6 +922,7 @@ impl NativeAgent {
                     .await
                 }),
                 context_server_registry,
+                runtime_tool_registry,
                 _subscriptions: subscriptions,
             },
         );
@@ -1594,6 +1600,8 @@ impl NativeAgent {
                         this.templates.clone(),
                         cx,
                     );
+                    // Share the per-project runtime tool registry (Source 3).
+                    thread.runtime_tool_registry = project_state.runtime_tool_registry.clone();
                     thread.set_summarization_model(summarization_model, cx);
                     thread
                 }))

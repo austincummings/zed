@@ -1464,6 +1464,96 @@ async fn test_profiles(cx: &mut TestAppContext) {
     assert_eq!(tool_names, vec![InfiniteTool::NAME]);
 }
 
+/// Source 3 (runtime-registered) tools reach the model just like built-ins:
+/// they are enabled by default even when the active profile does not list
+/// them, a profile can still opt one out by name, and unregistering removes
+/// them entirely.
+#[gpui::test]
+async fn test_runtime_registered_tool_is_exposed(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    thread.update(cx, |thread, cx| {
+        // A normal built-in via the existing path...
+        thread.add_tool(EchoTool);
+        // ...and a runtime tool via Source 3 (in-process). Note it is NOT
+        // listed in either profile below, proving runtime tools default on.
+        thread.register_runtime_tool(DelayTool.erase(), crate::ToolSource::InProcess, cx);
+    });
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "profiles": {
+                    "rt": {
+                        "name": "RT",
+                        "tools": { EchoTool::NAME: true }
+                    },
+                    "rt-optout": {
+                        "name": "RT Opt-out",
+                        "tools": { EchoTool::NAME: true, DelayTool::NAME: false }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    let tool_names_for = |profile: &str, cx: &mut TestAppContext| -> Vec<String> {
+        thread
+            .update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(profile.to_string().into()), cx);
+                thread.send(ClientUserMessageId::new(), ["test"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let mut pending = fake_model.pending_completions();
+        let completion = pending.pop().expect("expected a pending completion");
+        let names = completion
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        fake_model.end_last_completion_stream();
+        cx.run_until_parked();
+        names
+    };
+
+    // Unlisted in the active profile, yet exposed alongside the built-in.
+    let names = tool_names_for("rt", cx);
+    assert!(
+        names.contains(&EchoTool::NAME.to_string()),
+        "built-in should be exposed, got {names:?}"
+    );
+    assert!(
+        names.contains(&DelayTool::NAME.to_string()),
+        "runtime-registered tool should be exposed to the model, got {names:?}"
+    );
+
+    // A profile may opt a runtime tool out by name.
+    let names = tool_names_for("rt-optout", cx);
+    assert!(
+        !names.contains(&DelayTool::NAME.to_string()),
+        "profile opt-out should hide the runtime tool, got {names:?}"
+    );
+
+    // Unregistering removes it entirely.
+    thread.update(cx, |thread, cx| {
+        assert!(thread.unregister_runtime_tool(DelayTool::NAME, cx));
+    });
+    let names = tool_names_for("rt", cx);
+    assert!(
+        !names.contains(&DelayTool::NAME.to_string()),
+        "unregistered tool should not be exposed, got {names:?}"
+    );
+}
+
 #[gpui::test]
 async fn test_mcp_tools(cx: &mut TestAppContext) {
     let ThreadTest {
