@@ -1,17 +1,16 @@
 use std::{
-    collections::BTreeMap,
-    hash::{Hash, Hasher},
+    collections::{BTreeMap, HashMap},
     ops::Range,
     path::Path,
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::FuturesUnordered};
 use gpui::{App, AppContext, Context, Entity, SharedString, Subscription, Task};
 use itertools::Itertools;
 use language::{Buffer, BufferEvent};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
 use text::{BufferSnapshot, Point};
 
 use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
@@ -26,6 +25,7 @@ pub struct Bookmark {
 /// Number of lines above and below the bookmarked line hashed into
 /// [`ContentMarker::context_hash`].
 const CONTEXT_WINDOW: u32 = 2;
+pub const SYNTACTIC_LOCATION_VERSION: u32 = 1;
 
 /// A durable, serializable description of where a bookmark should be placed,
 /// re-resolved against a buffer's outline at open/reload time.
@@ -48,9 +48,8 @@ pub struct SyntacticLocation {
 /// bookmark sits.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SymbolRef {
-    /// Dotted outline path of the enclosing symbol, innermost last, e.g.
-    /// `"impl BookmarkStore › fn toggle_bookmark"`.
-    pub symbol_path: SharedString,
+    /// Outline path of the enclosing symbol, innermost last.
+    pub symbol_path: Vec<SharedString>,
     /// The nth occurrence (0-based) of an identical `symbol_path` in the file,
     /// used to disambiguate paths that collapse to the same text.
     pub symbol_ordinal: u32,
@@ -68,7 +67,94 @@ pub struct ContentMarker {
     /// Hash of a normalized window of surrounding lines (±[`CONTEXT_WINDOW`]).
     /// A tiebreaker only, consulted when `line_text` is ambiguous within the
     /// search window.
-    pub context_hash: u64,
+    pub context_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SerializedSyntacticLocation {
+    pub symbol: Option<SerializedSymbolRef>,
+    pub content_marker: SerializedContentMarker,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SerializedSymbolRef {
+    pub symbol_path: Vec<String>,
+    pub symbol_ordinal: u32,
+    pub line_offset_in_symbol: u32,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SerializedContentMarker {
+    pub line_text: String,
+    pub context_hash: String,
+}
+
+impl SerializedSyntacticLocation {
+    pub fn validate(&self) -> Result<()> {
+        self.validated_context_hash()?;
+        Ok(())
+    }
+
+    fn validated_context_hash(&self) -> Result<[u8; 32]> {
+        if self
+            .symbol
+            .as_ref()
+            .is_some_and(|symbol| symbol.symbol_path.is_empty())
+        {
+            anyhow::bail!("syntactic bookmark symbol path is empty");
+        }
+        hex::decode(&self.content_marker.context_hash)
+            .context("invalid syntactic bookmark context hash")?
+            .try_into()
+            .map_err(|hash: Vec<u8>| {
+                anyhow::anyhow!(
+                    "invalid syntactic bookmark context hash length: expected 32 bytes, got {}",
+                    hash.len()
+                )
+            })
+    }
+
+    fn to_syntactic_location(&self, last_known_row: u32) -> Result<SyntacticLocation> {
+        let context_hash = self.validated_context_hash()?;
+
+        Ok(SyntacticLocation {
+            symbol: self.symbol.as_ref().map(|symbol| SymbolRef {
+                symbol_path: symbol
+                    .symbol_path
+                    .iter()
+                    .cloned()
+                    .map(SharedString::from)
+                    .collect(),
+                symbol_ordinal: symbol.symbol_ordinal,
+                line_offset_in_symbol: symbol.line_offset_in_symbol,
+            }),
+            content_marker: ContentMarker {
+                line_text: self.content_marker.line_text.clone().into(),
+                context_hash,
+            },
+            last_known_row,
+        })
+    }
+}
+
+impl From<&SyntacticLocation> for SerializedSyntacticLocation {
+    fn from(location: &SyntacticLocation) -> Self {
+        Self {
+            symbol: location.symbol.as_ref().map(|symbol| SerializedSymbolRef {
+                symbol_path: symbol
+                    .symbol_path
+                    .iter()
+                    .map(|segment| segment.to_string())
+                    .collect(),
+                symbol_ordinal: symbol.symbol_ordinal,
+                line_offset_in_symbol: symbol.line_offset_in_symbol,
+            }),
+            content_marker: SerializedContentMarker {
+                line_text: location.content_marker.line_text.to_string(),
+                context_hash: hex::encode(location.content_marker.context_hash),
+            },
+        }
+    }
 }
 
 /// Trims a line and collapses internal runs of whitespace into a single space,
@@ -99,9 +185,18 @@ pub fn compute_syntactic_location(
     snapshot: &language::BufferSnapshot,
     anchor: text::Anchor,
 ) -> SyntacticLocation {
+    let index = SyntacticLocationIndex::new(snapshot);
+    compute_syntactic_location_with_index(snapshot, &index, anchor)
+}
+
+fn compute_syntactic_location_with_index(
+    snapshot: &language::BufferSnapshot,
+    index: &SyntacticLocationIndex,
+    anchor: text::Anchor,
+) -> SyntacticLocation {
     let row = anchor.summary::<Point>(snapshot).row;
 
-    let symbol = compute_symbol_ref(snapshot, row);
+    let symbol = compute_symbol_ref(snapshot, index, row);
     let content_marker = compute_content_marker(snapshot, row);
 
     SyntacticLocation {
@@ -111,23 +206,55 @@ pub fn compute_syntactic_location(
     }
 }
 
-const SYMBOL_PATH_SEPARATOR: &str = " › ";
+#[derive(Default)]
+struct SyntacticLocationIndex {
+    ordinals: HashMap<(Point, Point, Vec<SharedString>), u32>,
+}
 
-fn compute_symbol_ref(snapshot: &language::BufferSnapshot, row: u32) -> Option<SymbolRef> {
+impl SyntacticLocationIndex {
+    fn new(snapshot: &language::BufferSnapshot) -> Self {
+        let items = snapshot.outline(None).items;
+        let mut path_stack = Vec::new();
+        let mut next_ordinal_by_path = HashMap::<Vec<SharedString>, u32>::new();
+        let mut ordinals = HashMap::with_capacity(items.len());
+
+        for item in items {
+            path_stack.truncate(item.depth);
+            path_stack.push(item.text);
+            let symbol_path = path_stack.clone();
+            let next_ordinal = next_ordinal_by_path.entry(symbol_path.clone()).or_default();
+            let ordinal = *next_ordinal;
+            *next_ordinal += 1;
+
+            let start = item.range.start.summary::<Point>(snapshot);
+            let end = item.range.end.summary::<Point>(snapshot);
+            ordinals.insert((start, end, symbol_path), ordinal);
+        }
+
+        Self { ordinals }
+    }
+}
+
+fn compute_symbol_ref(
+    snapshot: &language::BufferSnapshot,
+    index: &SyntacticLocationIndex,
+    row: u32,
+) -> Option<SymbolRef> {
     let containing = snapshot.symbols_containing(syntax_lookup_point(snapshot, row), None);
     let innermost = containing.last()?;
-    let symbol_path: SharedString = join_symbol_path(containing.iter().map(|item| &item.text));
+    let symbol_path = containing
+        .iter()
+        .map(|item| item.text.clone())
+        .collect::<Vec<_>>();
 
     let symbol_start_row = innermost.range.start.summary::<Point>(snapshot).row;
     let line_offset_in_symbol = row.saturating_sub(symbol_start_row);
-
-    // Count how many earlier symbols in the file collapse to the same full
-    // path, so the resolver can pick the right one when a path isn't unique.
-    let symbol_ordinal = outline_item_paths(snapshot)
-        .into_iter()
-        .take_while(|(item_start_row, _)| *item_start_row < symbol_start_row)
-        .filter(|(_, path)| *path == symbol_path)
-        .count() as u32;
+    let range_start = innermost.range.start.summary::<Point>(snapshot);
+    let range_end = innermost.range.end.summary::<Point>(snapshot);
+    let symbol_ordinal = index
+        .ordinals
+        .get(&(range_start, range_end, symbol_path.clone()))
+        .copied()?;
 
     Some(SymbolRef {
         symbol_path,
@@ -136,46 +263,25 @@ fn compute_symbol_ref(snapshot: &language::BufferSnapshot, row: u32) -> Option<S
     })
 }
 
-fn join_symbol_path<'a>(segments: impl Iterator<Item = &'a SharedString>) -> SharedString {
-    segments
-        .map(|text| text.as_ref())
-        .collect::<Vec<_>>()
-        .join(SYMBOL_PATH_SEPARATOR)
-        .into()
-}
-
-/// Builds the full dotted path of every outline item in the file, paired with
-/// its start row. Mirrors the depth-based path-stack construction used by
-/// [`language::Outline::new`], so the paths line up with the one produced from
-/// [`language::BufferSnapshot::symbols_containing`].
-fn outline_item_paths(snapshot: &language::BufferSnapshot) -> Vec<(u32, SharedString)> {
-    let items = snapshot.outline(None).items;
-    let mut paths = Vec::with_capacity(items.len());
-    let mut path_stack: Vec<SharedString> = Vec::new();
-    for item in &items {
-        path_stack.truncate(item.depth);
-        path_stack.push(item.text.clone());
-        let start_row = item.range.start.summary::<Point>(snapshot).row;
-        paths.push((start_row, join_symbol_path(path_stack.iter())));
-    }
-    paths
-}
-
 fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker {
     let normalized = normalize_line(&line_text(snapshot, row));
 
-    let mut hasher = collections::FxHasher::default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zed-syntactic-bookmark-context-v1\0");
     let max_row = snapshot.max_point().row;
     let start = row.saturating_sub(CONTEXT_WINDOW);
     let end = (row + CONTEXT_WINDOW).min(max_row);
+    hasher.update((row - start).to_le_bytes());
     for context_row in start..=end {
-        normalize_line(&line_text(snapshot, context_row)).hash(&mut hasher);
-        0xffu8.hash(&mut hasher);
+        let context_line = normalize_line(&line_text(snapshot, context_row));
+        let line_length = u32::try_from(context_line.len()).unwrap_or(u32::MAX);
+        hasher.update(line_length.to_le_bytes());
+        hasher.update(context_line.as_bytes());
     }
 
     ContentMarker {
         line_text: normalized.into(),
-        context_hash: hasher.finish(),
+        context_hash: hasher.finalize().into(),
     }
 }
 
@@ -183,6 +289,7 @@ fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker 
 pub struct SerializedBookmark {
     pub row: u32,
     pub label: String,
+    pub syntactic_location: Option<SerializedSyntacticLocation>,
 }
 
 #[derive(Debug)]
@@ -291,6 +398,7 @@ impl BookmarkStore {
 
         let snapshot = buffer.read(cx).snapshot();
         let max_point = snapshot.max_point();
+        let syntactic_location_index = SyntacticLocationIndex::new(&snapshot);
 
         let bookmarks: Vec<Bookmark> = bookmarks
             .iter()
@@ -308,10 +416,27 @@ impl BookmarkStore {
                 }
 
                 let anchor = snapshot.anchor_after(point);
-                // Phase 1: still resolve by row; recompute the syntactic
-                // location from the freshly opened buffer so the field is
-                // populated. The resolution ladder that consumes it lands later.
-                let syntactic_location = compute_syntactic_location(&snapshot, anchor);
+                let syntactic_location = bookmark
+                    .syntactic_location
+                    .as_ref()
+                    .and_then(|location| match location.to_syntactic_location(bookmark.row) {
+                        Ok(location) => Some(location),
+                        Err(error) => {
+                            log::warn!(
+                                "Ignoring invalid syntactic location for bookmark at {} row {}: {error:#}",
+                                abs_path.display(),
+                                bookmark.row
+                            );
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        compute_syntactic_location_with_index(
+                            &snapshot,
+                            &syntactic_location_index,
+                            anchor,
+                        )
+                    });
                 Some(Bookmark {
                     anchor,
                     label: bookmark.label.clone(),
@@ -550,6 +675,7 @@ impl BookmarkStore {
                     BookmarkEntry::Unloaded(rows) => rows.clone(),
                     BookmarkEntry::Loaded(buffer_bookmarks) => {
                         let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
+                        let syntactic_location_index = SyntacticLocationIndex::new(&snapshot);
                         buffer_bookmarks
                             .bookmarks
                             .iter()
@@ -559,9 +685,15 @@ impl BookmarkStore {
                                 }
                                 let row =
                                     snapshot.summary_for_anchor::<Point>(&bookmark.anchor).row;
+                                let syntactic_location = compute_syntactic_location_with_index(
+                                    &snapshot,
+                                    &syntactic_location_index,
+                                    bookmark.anchor,
+                                );
                                 Some(SerializedBookmark {
                                     row,
                                     label: bookmark.label.clone(),
+                                    syntactic_location: Some((&syntactic_location).into()),
                                 })
                             })
                             .collect()
@@ -757,7 +889,7 @@ mod tests {
         assert_eq!(
             location.symbol,
             Some(SymbolRef {
-                symbol_path: "fn bookmarked".into(),
+                symbol_path: vec!["fn bookmarked".into()],
                 symbol_ordinal: 0,
                 line_offset_in_symbol: 2,
             })
@@ -776,7 +908,13 @@ mod tests {
         );
 
         let symbol = location.symbol.expect("expected an enclosing Rust symbol");
-        assert_eq!(symbol.symbol_path, "impl Store › fn bookmarked");
+        assert_eq!(
+            symbol.symbol_path,
+            vec![
+                SharedString::from("impl Store"),
+                SharedString::from("fn bookmarked")
+            ]
+        );
         assert_eq!(symbol.symbol_ordinal, 0);
         assert_eq!(symbol.line_offset_in_symbol, 0);
     }
@@ -806,7 +944,13 @@ mod tests {
         let symbol = location
             .symbol
             .expect("expected an enclosing TypeScript symbol");
-        assert_eq!(symbol.symbol_path, "class Store › bookmarked()");
+        assert_eq!(
+            symbol.symbol_path,
+            vec![
+                SharedString::from("class Store"),
+                SharedString::from("bookmarked()")
+            ]
+        );
         assert_eq!(symbol.symbol_ordinal, 0);
         assert_eq!(symbol.line_offset_in_symbol, 0);
     }
@@ -882,15 +1026,58 @@ mod tests {
     fn test_content_marker_clamps_context_at_buffer_boundaries(cx: &mut TestAppContext) {
         let first = syntactic_location_at_row("one\ntwo\nthree\n", 0, false, cx);
         let first_again = syntactic_location_at_row("one\ntwo\nthree\n", 0, false, cx);
-        let last = syntactic_location_at_row("one\ntwo\nthree\n", 2, false, cx);
 
         assert_eq!(
             first.content_marker.context_hash,
             first_again.content_marker.context_hash
         );
+        assert_eq!(
+            hex::encode(first.content_marker.context_hash),
+            "735f2ddfccb8660f138e80c2bd5605f92ba444884fef30c08ef5f4c7afaf13a8"
+        );
+    }
+
+    #[gpui::test]
+    fn test_content_marker_encodes_target_position(cx: &mut TestAppContext) {
+        let first = syntactic_location_at_row("same\nmiddle\nsame", 0, false, cx);
+        let last = syntactic_location_at_row("same\nmiddle\nsame", 2, false, cx);
+
+        assert_eq!(
+            first.content_marker.line_text,
+            last.content_marker.line_text
+        );
         assert_ne!(
             first.content_marker.context_hash,
             last.content_marker.context_hash
         );
+    }
+
+    #[gpui::test]
+    fn test_serialized_syntactic_location_round_trip(cx: &mut TestAppContext) {
+        let location = typescript_syntactic_location_at_row(
+            "class Store {\n    bookmarked(): void {\n        const value = 1;\n    }\n}\n",
+            2,
+            cx,
+        );
+        let serialized = SerializedSyntacticLocation::from(&location);
+        let restored = serialized
+            .to_syntactic_location(location.last_known_row)
+            .expect("valid serialized syntactic location");
+
+        assert_eq!(restored, location);
+        assert_eq!(serialized.content_marker.context_hash.len(), 64);
+    }
+
+    #[test]
+    fn test_serialized_syntactic_location_rejects_invalid_hash() {
+        let serialized = SerializedSyntacticLocation {
+            symbol: None,
+            content_marker: SerializedContentMarker {
+                line_text: "bookmarked".to_string(),
+                context_hash: "invalid".to_string(),
+            },
+        };
+
+        assert!(serialized.to_syntactic_location(0).is_err());
     }
 }

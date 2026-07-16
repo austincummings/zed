@@ -3,7 +3,13 @@ use std::{path::Path, sync::Arc};
 use collections::BTreeMap;
 use gpui::{Entity, TestAppContext};
 use language::Buffer;
-use project::{Project, bookmark_store::SerializedBookmark};
+use project::{
+    Project,
+    bookmark_store::{
+        SerializedBookmark, SerializedContentMarker, SerializedSymbolRef,
+        SerializedSyntacticLocation,
+    },
+};
 use serde_json::json;
 use util::path;
 
@@ -27,6 +33,7 @@ mod integration {
         SerializedBookmark {
             row,
             label: String::new(),
+            syntactic_location: None,
         }
     }
 
@@ -191,6 +198,12 @@ mod integration {
         let bookmarks = get_all_bookmarks(&project, cx);
         assert_eq!(bookmarks.len(), 1);
         assert_bookmark_rows(&bookmarks, path!("/project/file1.rs"), &[0, 2]);
+        assert!(
+            bookmarks
+                .values()
+                .flatten()
+                .all(|bookmark| bookmark.syntactic_location.is_some())
+        );
     }
 
     #[gpui::test]
@@ -398,6 +411,45 @@ mod integration {
     }
 
     #[gpui::test]
+    async fn test_unloaded_syntactic_locations_are_preserved(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file1.rs": "fn bookmarked() {\n    return;\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let serialized = BTreeMap::from([(
+            project_path(path!("/project/file1.rs")),
+            vec![SerializedBookmark {
+                row: 1,
+                label: "inside function".to_string(),
+                syntactic_location: Some(SerializedSyntacticLocation {
+                    symbol: Some(SerializedSymbolRef {
+                        symbol_path: vec!["fn bookmarked".to_string()],
+                        symbol_ordinal: 0,
+                        line_offset_in_symbol: 1,
+                    }),
+                    content_marker: SerializedContentMarker {
+                        line_text: "return;".to_string(),
+                        context_hash:
+                            "735f2ddfccb8660f138e80c2bd5605f92ba444884fef30c08ef5f4c7afaf13a8"
+                                .to_string(),
+                    },
+                }),
+            }],
+        )]);
+
+        restore_bookmarks(&project, serialized.clone(), cx).await;
+
+        assert_eq!(get_all_bookmarks(&project, cx), serialized);
+    }
+
+    #[gpui::test]
     async fn test_with_serialized_bookmarks_skips_out_of_range_rows(cx: &mut TestAppContext) {
         init_test(cx);
         cx.executor().allow_parking();
@@ -598,6 +650,21 @@ mod integration {
 
         let serialized = get_all_bookmarks(&project, cx);
         assert_bookmark_rows(&serialized, path!("/project/file.rs"), &[2, 4]);
+        let content_lines = serialized
+            .get(&project_path(path!("/project/file.rs")))
+            .expect("bookmarks for edited file")
+            .iter()
+            .map(|bookmark| {
+                bookmark
+                    .syntactic_location
+                    .as_ref()
+                    .expect("syntactic location")
+                    .content_marker
+                    .line_text
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(content_lines, ["bbb", "ddd"]);
 
         // Clear and restore
         clear_bookmarks(&project, cx);

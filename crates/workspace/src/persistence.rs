@@ -22,7 +22,10 @@ use db::{
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::{
     ProjectGroupKey,
-    bookmark_store::SerializedBookmark,
+    bookmark_store::{
+        SYNTACTIC_LOCATION_VERSION, SerializedBookmark, SerializedContentMarker,
+        SerializedSymbolRef, SerializedSyntacticLocation,
+    },
     debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
@@ -395,12 +398,12 @@ pub async fn write_default_dock_state(
 pub struct Bookmark {
     pub row: u32,
     pub label: String,
+    pub syntactic_location: Option<SerializedSyntacticLocation>,
 }
 
 impl sqlez::bindable::StaticColumnCount for Bookmark {
     fn column_count() -> usize {
-        // row, label
-        2
+        8
     }
 }
 
@@ -410,8 +413,43 @@ impl sqlez::bindable::Bind for Bookmark {
         statement: &sqlez::statement::Statement,
         start_index: i32,
     ) -> anyhow::Result<i32> {
+        let version = self
+            .syntactic_location
+            .as_ref()
+            .map(|_| SYNTACTIC_LOCATION_VERSION);
+        let symbol_path_json = self
+            .syntactic_location
+            .as_ref()
+            .and_then(|location| location.symbol.as_ref())
+            .map(|symbol| serde_json::to_string(&symbol.symbol_path))
+            .transpose()?;
+        let symbol_ordinal = self
+            .syntactic_location
+            .as_ref()
+            .and_then(|location| location.symbol.as_ref())
+            .map(|symbol| symbol.symbol_ordinal);
+        let line_offset_in_symbol = self
+            .syntactic_location
+            .as_ref()
+            .and_then(|location| location.symbol.as_ref())
+            .map(|symbol| symbol.line_offset_in_symbol);
+        let content_line = self
+            .syntactic_location
+            .as_ref()
+            .map(|location| location.content_marker.line_text.as_str());
+        let context_hash = self
+            .syntactic_location
+            .as_ref()
+            .map(|location| location.content_marker.context_hash.as_str());
+
         let next_index = statement.bind(&self.row, start_index)?;
-        statement.bind(&self.label, next_index)
+        let next_index = statement.bind(&self.label, next_index)?;
+        let next_index = statement.bind(&version, next_index)?;
+        let next_index = statement.bind(&symbol_path_json, next_index)?;
+        let next_index = statement.bind(&symbol_ordinal, next_index)?;
+        let next_index = statement.bind(&line_offset_in_symbol, next_index)?;
+        let next_index = statement.bind(&content_line, next_index)?;
+        statement.bind(&context_hash, next_index)
     }
 }
 
@@ -423,9 +461,110 @@ impl Column for Bookmark {
             as u32;
 
         let (label, next_index) = String::column(statement, start_index + 1)?;
+        let (version, next_index) = Option::<i64>::column(statement, next_index)?;
+        let (symbol_path_json, next_index) = Option::<String>::column(statement, next_index)?;
+        let (symbol_ordinal, next_index) = Option::<i64>::column(statement, next_index)?;
+        let (line_offset_in_symbol, next_index) = Option::<i64>::column(statement, next_index)?;
+        let (content_line, next_index) = Option::<String>::column(statement, next_index)?;
+        let (context_hash, next_index) = Option::<String>::column(statement, next_index)?;
 
-        Ok((Bookmark { row, label }, next_index))
+        let syntactic_location = deserialize_syntactic_location(
+            version,
+            symbol_path_json,
+            symbol_ordinal,
+            line_offset_in_symbol,
+            content_line,
+            context_hash,
+        );
+
+        Ok((
+            Bookmark {
+                row,
+                label,
+                syntactic_location,
+            },
+            next_index,
+        ))
     }
+}
+
+fn deserialize_syntactic_location(
+    version: Option<i64>,
+    symbol_path_json: Option<String>,
+    symbol_ordinal: Option<i64>,
+    line_offset_in_symbol: Option<i64>,
+    content_line: Option<String>,
+    context_hash: Option<String>,
+) -> Option<SerializedSyntacticLocation> {
+    let version = version?;
+    if version != i64::from(SYNTACTIC_LOCATION_VERSION) {
+        log::warn!("Ignoring bookmark with unsupported syntactic location version {version}");
+        return None;
+    }
+
+    let Some(content_line) = content_line else {
+        log::warn!("Ignoring syntactic bookmark location without content line");
+        return None;
+    };
+    let Some(context_hash) = context_hash else {
+        log::warn!("Ignoring syntactic bookmark location without context hash");
+        return None;
+    };
+
+    let symbol = match (symbol_path_json, symbol_ordinal, line_offset_in_symbol) {
+        (None, None, None) => None,
+        (Some(symbol_path_json), Some(symbol_ordinal), Some(line_offset_in_symbol)) => {
+            let symbol_path = match serde_json::from_str(&symbol_path_json) {
+                Ok(symbol_path) => symbol_path,
+                Err(error) => {
+                    log::warn!(
+                        "Ignoring syntactic bookmark location with invalid symbol path: {error:#}"
+                    );
+                    return None;
+                }
+            };
+            let symbol_ordinal = match u32::try_from(symbol_ordinal) {
+                Ok(symbol_ordinal) => symbol_ordinal,
+                Err(error) => {
+                    log::warn!(
+                        "Ignoring syntactic bookmark location with invalid symbol ordinal: {error:#}"
+                    );
+                    return None;
+                }
+            };
+            let line_offset_in_symbol = match u32::try_from(line_offset_in_symbol) {
+                Ok(line_offset_in_symbol) => line_offset_in_symbol,
+                Err(error) => {
+                    log::warn!(
+                        "Ignoring syntactic bookmark location with invalid line offset: {error:#}"
+                    );
+                    return None;
+                }
+            };
+            Some(SerializedSymbolRef {
+                symbol_path,
+                symbol_ordinal,
+                line_offset_in_symbol,
+            })
+        }
+        _ => {
+            log::warn!("Ignoring syntactic bookmark location with incomplete symbol reference");
+            return None;
+        }
+    };
+
+    let location = SerializedSyntacticLocation {
+        symbol,
+        content_marker: SerializedContentMarker {
+            line_text: content_line,
+            context_hash,
+        },
+    };
+    if let Err(error) = location.validate() {
+        log::warn!("Ignoring invalid syntactic bookmark location: {error:#}");
+        return None;
+    }
+    Some(location)
 }
 
 #[derive(Debug)]
@@ -1051,6 +1190,14 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE bookmarks ADD COLUMN label TEXT NOT NULL DEFAULT "";
         ),
+        sql!(
+            ALTER TABLE bookmarks ADD COLUMN syntactic_location_version INTEGER;
+            ALTER TABLE bookmarks ADD COLUMN symbol_path_json TEXT;
+            ALTER TABLE bookmarks ADD COLUMN symbol_ordinal INTEGER;
+            ALTER TABLE bookmarks ADD COLUMN line_offset_in_symbol INTEGER;
+            ALTER TABLE bookmarks ADD COLUMN content_line TEXT;
+            ALTER TABLE bookmarks ADD COLUMN context_hash TEXT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1312,7 +1459,8 @@ impl WorkspaceDb {
     fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
         let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
             .select_bound(sql! {
-                SELECT path, row, label
+                SELECT path, row, label, syntactic_location_version, symbol_path_json,
+                    symbol_ordinal, line_offset_in_symbol, content_line, context_hash
                 FROM bookmarks
                 WHERE workspace_id = ?
                 ORDER BY path, row
@@ -1334,6 +1482,7 @@ impl WorkspaceDb {
                         .push(SerializedBookmark {
                             row: bookmark.row,
                             label: bookmark.label,
+                            syntactic_location: bookmark.syntactic_location,
                         })
                 }
 
@@ -1496,9 +1645,29 @@ impl WorkspaceDb {
                 for (path, bookmarks) in workspace.bookmarks {
                     for bookmark in bookmarks {
                         conn.exec_bound(sql!(
-                            INSERT INTO bookmarks (workspace_id, path, row, label)
-                            VALUES (?1, ?2, ?3, ?4);
-                        ))?((workspace.id, path.as_ref(), bookmark.row, bookmark.label)).context("Inserting bookmark")?;
+                            INSERT INTO bookmarks (
+                                workspace_id,
+                                path,
+                                row,
+                                label,
+                                syntactic_location_version,
+                                symbol_path_json,
+                                symbol_ordinal,
+                                line_offset_in_symbol,
+                                content_line,
+                                context_hash
+                            )
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);
+                        ))?((
+                            workspace.id,
+                            path.as_ref(),
+                            Bookmark {
+                                row: bookmark.row,
+                                label: bookmark.label,
+                                syntactic_location: bookmark.syntactic_location,
+                            },
+                        ))
+                        .context("Inserting bookmark")?;
                     }
                 }
 
@@ -3046,6 +3215,123 @@ mod tests {
         );
         assert_eq!(loaded_breakpoints[4].state, hit_condition_breakpoint.state);
         assert_eq!(loaded_breakpoints[4].path, Arc::from(path));
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_with_syntactic_locations() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_bookmarks_with_syntactic_locations").await;
+        let id = db.next_id().await.unwrap();
+        let path = Arc::<Path>::from(Path::new("/tmp/bookmarks.ts"));
+        let expected_bookmarks = BTreeMap::from([(
+            path,
+            vec![
+                SerializedBookmark {
+                    row: 5,
+                    label: "method".to_string(),
+                    syntactic_location: Some(SerializedSyntacticLocation {
+                        symbol: Some(SerializedSymbolRef {
+                            symbol_path: vec![
+                                "class Store".to_string(),
+                                "bookmarked()".to_string(),
+                            ],
+                            symbol_ordinal: 2,
+                            line_offset_in_symbol: 3,
+                        }),
+                        content_marker: SerializedContentMarker {
+                            line_text: "return value;".to_string(),
+                            context_hash: "ab".repeat(32),
+                        },
+                    }),
+                },
+                SerializedBookmark {
+                    row: 9,
+                    label: "legacy".to_string(),
+                    syntactic_location: None,
+                },
+                SerializedBookmark {
+                    row: 12,
+                    label: "plaintext".to_string(),
+                    syntactic_location: Some(SerializedSyntacticLocation {
+                        symbol: None,
+                        content_marker: SerializedContentMarker {
+                            line_text: "bookmarked text".to_string(),
+                            context_hash: "cd".repeat(32),
+                        },
+                    }),
+                },
+            ],
+        )]);
+        let workspace = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            identity_paths: None,
+            location: SerializedWorkspaceLocation::Local,
+            center_group: Default::default(),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: expected_bookmarks.clone(),
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+
+        db.save_workspace(workspace).await;
+
+        let loaded = db.workspace_for_roots(&["/tmp"]).unwrap();
+        assert_eq!(loaded.bookmarks, expected_bookmarks);
+    }
+
+    #[test]
+    fn test_invalid_syntactic_locations_fall_back_to_row() {
+        assert_eq!(
+            deserialize_syntactic_location(
+                Some(i64::from(SYNTACTIC_LOCATION_VERSION) + 1),
+                None,
+                None,
+                None,
+                Some("line".to_string()),
+                Some("ab".repeat(32)),
+            ),
+            None
+        );
+        assert_eq!(
+            deserialize_syntactic_location(
+                Some(i64::from(SYNTACTIC_LOCATION_VERSION)),
+                Some("[\"symbol\"]".to_string()),
+                None,
+                Some(0),
+                Some("line".to_string()),
+                Some("ab".repeat(32)),
+            ),
+            None
+        );
+        assert_eq!(
+            deserialize_syntactic_location(
+                Some(i64::from(SYNTACTIC_LOCATION_VERSION)),
+                Some("{".to_string()),
+                Some(0),
+                Some(0),
+                Some("line".to_string()),
+                Some("ab".repeat(32)),
+            ),
+            None
+        );
+        assert_eq!(
+            deserialize_syntactic_location(
+                Some(i64::from(SYNTACTIC_LOCATION_VERSION)),
+                None,
+                None,
+                None,
+                Some("line".to_string()),
+                Some("invalid".to_string()),
+            ),
+            None
+        );
     }
 
     #[gpui::test]
