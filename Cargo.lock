@@ -14070,6 +14070,7 @@ dependencies = [
  "git_hosting_providers",
  "globset",
  "gpui",
+ "hex",
  "http_client",
  "image",
  "indexmap 2.14.0",
