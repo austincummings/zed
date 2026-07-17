@@ -1,4 +1,5 @@
 use std::{
+    cell::OnceCell,
     collections::{BTreeMap, HashMap},
     ops::Range,
     path::Path,
@@ -206,21 +207,30 @@ fn compute_syntactic_location_with_index(
     }
 }
 
-#[derive(Default)]
 struct SyntacticLocationIndex {
     ordinals: HashMap<(Point, Point, Vec<SharedString>), u32>,
+    symbols: Vec<IndexedSymbol>,
+    outline: language::Outline<text::Anchor>,
+    rows_by_line_text: OnceCell<HashMap<SharedString, Vec<u32>>>,
+}
+
+struct IndexedSymbol {
+    symbol_path: Vec<SharedString>,
+    symbol_ordinal: u32,
+    range: Range<Point>,
 }
 
 impl SyntacticLocationIndex {
     fn new(snapshot: &language::BufferSnapshot) -> Self {
-        let items = snapshot.outline(None).items;
+        let outline = snapshot.outline(None);
         let mut path_stack = Vec::new();
         let mut next_ordinal_by_path = HashMap::<Vec<SharedString>, u32>::new();
-        let mut ordinals = HashMap::with_capacity(items.len());
+        let mut ordinals = HashMap::with_capacity(outline.items.len());
+        let mut symbols = Vec::with_capacity(outline.items.len());
 
-        for item in items {
+        for item in &outline.items {
             path_stack.truncate(item.depth);
-            path_stack.push(item.text);
+            path_stack.push(item.text.clone());
             let symbol_path = path_stack.clone();
             let next_ordinal = next_ordinal_by_path.entry(symbol_path.clone()).or_default();
             let ordinal = *next_ordinal;
@@ -228,10 +238,41 @@ impl SyntacticLocationIndex {
 
             let start = item.range.start.summary::<Point>(snapshot);
             let end = item.range.end.summary::<Point>(snapshot);
-            ordinals.insert((start, end, symbol_path), ordinal);
+            ordinals.insert((start, end, symbol_path.clone()), ordinal);
+            symbols.push(IndexedSymbol {
+                symbol_path,
+                symbol_ordinal: ordinal,
+                range: start..end,
+            });
         }
 
-        Self { ordinals }
+        Self {
+            ordinals,
+            symbols,
+            outline,
+            rows_by_line_text: OnceCell::new(),
+        }
+    }
+
+    fn rows_matching_line(
+        &self,
+        snapshot: &language::BufferSnapshot,
+        normalized_line: &SharedString,
+    ) -> &[u32] {
+        self.rows_by_line_text
+            .get_or_init(|| {
+                let mut rows_by_line_text = HashMap::<SharedString, Vec<u32>>::new();
+                for row in 0..=snapshot.max_point().row {
+                    rows_by_line_text
+                        .entry(normalize_line(&line_text(snapshot, row)).into())
+                        .or_default()
+                        .push(row);
+                }
+                rows_by_line_text
+            })
+            .get(normalized_line)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -282,6 +323,260 @@ fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker 
     ContentMarker {
         line_text: normalized.into(),
         context_hash: hasher.finalize().into(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookmarkResolution {
+    ExactSymbol,
+    SymbolContent,
+    FuzzySymbol,
+    ContentOnly,
+    RowFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedBookmarkLocation {
+    row: u32,
+    resolution: BookmarkResolution,
+}
+
+fn resolve_syntactic_location(
+    snapshot: &language::BufferSnapshot,
+    index: &SyntacticLocationIndex,
+    location: &SyntacticLocation,
+) -> Option<ResolvedBookmarkLocation> {
+    if let Some(symbol) = location.symbol.as_ref() {
+        if let Some(resolved) =
+            resolve_exact_symbol(snapshot, index, symbol, &location.content_marker)
+        {
+            return Some(resolved);
+        }
+
+        if let Some(resolved) =
+            resolve_fuzzy_symbol(snapshot, index, symbol, &location.content_marker)
+        {
+            return Some(resolved);
+        }
+    }
+
+    if let Some(row) = resolve_content_only(snapshot, index, location) {
+        return Some(ResolvedBookmarkLocation {
+            row,
+            resolution: BookmarkResolution::ContentOnly,
+        });
+    }
+
+    (location.last_known_row <= snapshot.max_point().row).then_some(ResolvedBookmarkLocation {
+        row: location.last_known_row,
+        resolution: BookmarkResolution::RowFallback,
+    })
+}
+
+fn resolve_exact_symbol(
+    snapshot: &language::BufferSnapshot,
+    index: &SyntacticLocationIndex,
+    symbol: &SymbolRef,
+    content_marker: &ContentMarker,
+) -> Option<ResolvedBookmarkLocation> {
+    let matching_symbols = index
+        .symbols
+        .iter()
+        .filter(|candidate| candidate.symbol_path == symbol.symbol_path)
+        .collect::<Vec<_>>();
+    if matching_symbols.is_empty() {
+        return None;
+    }
+
+    let preferred_symbol = matching_symbols
+        .iter()
+        .copied()
+        .find(|candidate| candidate.symbol_ordinal == symbol.symbol_ordinal);
+
+    let mut exact_context_matches = Vec::new();
+    let mut symbols_with_unique_line_matches = Vec::new();
+    let mut preferred_line_matches = Vec::new();
+
+    if !content_marker.line_text.is_empty() {
+        for candidate in matching_symbols.iter().copied() {
+            let expected_row = expected_row_in_symbol(candidate, symbol.line_offset_in_symbol);
+            let line_matches =
+                content_matches_in_symbol(snapshot, candidate, content_marker, expected_row);
+            let is_preferred = candidate.symbol_ordinal == symbol.symbol_ordinal;
+
+            exact_context_matches.extend(
+                line_matches
+                    .iter()
+                    .filter(|candidate| candidate.context_matches)
+                    .map(|candidate| {
+                        (
+                            *candidate,
+                            is_preferred,
+                            candidate.row.abs_diff(expected_row),
+                        )
+                    }),
+            );
+
+            if line_matches.len() == 1 {
+                symbols_with_unique_line_matches.push((candidate, line_matches[0], expected_row));
+            }
+
+            if is_preferred {
+                preferred_line_matches = line_matches;
+            }
+        }
+    }
+
+    if let Some((content_match, is_preferred, distance)) = exact_context_matches
+        .into_iter()
+        .min_by_key(|(_, is_preferred, distance)| (!*is_preferred, *distance))
+    {
+        return Some(ResolvedBookmarkLocation {
+            row: content_match.row,
+            resolution: if is_preferred && distance == 0 {
+                BookmarkResolution::ExactSymbol
+            } else {
+                BookmarkResolution::SymbolContent
+            },
+        });
+    }
+
+    if let Some(preferred_symbol) = preferred_symbol {
+        let expected_row = expected_row_in_symbol(preferred_symbol, symbol.line_offset_in_symbol);
+        if let Some(content_match) = preferred_line_matches
+            .into_iter()
+            .min_by_key(|candidate| candidate.row.abs_diff(expected_row))
+        {
+            return Some(ResolvedBookmarkLocation {
+                row: content_match.row,
+                resolution: if content_match.row == expected_row {
+                    BookmarkResolution::ExactSymbol
+                } else {
+                    BookmarkResolution::SymbolContent
+                },
+            });
+        }
+    }
+
+    if let [(_, content_match, _)] = symbols_with_unique_line_matches.as_slice() {
+        return Some(ResolvedBookmarkLocation {
+            row: content_match.row,
+            resolution: BookmarkResolution::SymbolContent,
+        });
+    }
+
+    preferred_symbol.map(|preferred_symbol| ResolvedBookmarkLocation {
+        row: expected_row_in_symbol(preferred_symbol, symbol.line_offset_in_symbol),
+        resolution: BookmarkResolution::ExactSymbol,
+    })
+}
+
+fn resolve_fuzzy_symbol(
+    snapshot: &language::BufferSnapshot,
+    index: &SyntacticLocationIndex,
+    symbol: &SymbolRef,
+    content_marker: &ContentMarker,
+) -> Option<ResolvedBookmarkLocation> {
+    if content_marker.line_text.is_empty() {
+        return None;
+    }
+
+    let query = symbol.symbol_path.iter().join(" ");
+    let (_, item) = index.outline.find_most_similar(&query)?;
+    let range =
+        item.range.start.summary::<Point>(snapshot)..item.range.end.summary::<Point>(snapshot);
+    let candidate = IndexedSymbol {
+        symbol_path: Vec::new(),
+        symbol_ordinal: 0,
+        range,
+    };
+    let expected_row = expected_row_in_symbol(&candidate, symbol.line_offset_in_symbol);
+    let matches = content_matches_in_symbol(snapshot, &candidate, content_marker, expected_row);
+    let row = matches
+        .iter()
+        .filter(|candidate| candidate.context_matches)
+        .min_by_key(|candidate| candidate.row.abs_diff(expected_row))
+        .map(|candidate| candidate.row)
+        .or_else(|| {
+            matches
+                .first()
+                .filter(|_| matches.len() == 1)
+                .map(|candidate| candidate.row)
+        })?;
+
+    Some(ResolvedBookmarkLocation {
+        row,
+        resolution: BookmarkResolution::FuzzySymbol,
+    })
+}
+
+fn resolve_content_only(
+    snapshot: &language::BufferSnapshot,
+    index: &SyntacticLocationIndex,
+    location: &SyntacticLocation,
+) -> Option<u32> {
+    if location.content_marker.line_text.is_empty() {
+        return None;
+    }
+
+    index
+        .rows_matching_line(snapshot, &location.content_marker.line_text)
+        .iter()
+        .copied()
+        .filter(|row| {
+            compute_content_marker(snapshot, *row).context_hash
+                == location.content_marker.context_hash
+        })
+        .min_by_key(|row| row.abs_diff(location.last_known_row))
+}
+
+#[derive(Clone, Copy)]
+struct ContentMatch {
+    row: u32,
+    context_matches: bool,
+}
+
+fn content_matches_in_symbol(
+    snapshot: &language::BufferSnapshot,
+    symbol: &IndexedSymbol,
+    content_marker: &ContentMarker,
+    expected_row: u32,
+) -> Vec<ContentMatch> {
+    let start_row = symbol.range.start.row.min(snapshot.max_point().row);
+    let end_row = symbol_end_row(symbol).min(snapshot.max_point().row);
+    if start_row > end_row {
+        return Vec::new();
+    }
+
+    let mut matches = (start_row..=end_row)
+        .filter_map(|row| {
+            (normalize_line(&line_text(snapshot, row)) == content_marker.line_text.as_ref()).then(
+                || ContentMatch {
+                    row,
+                    context_matches: compute_content_marker(snapshot, row).context_hash
+                        == content_marker.context_hash,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable_by_key(|candidate| candidate.row.abs_diff(expected_row));
+    matches
+}
+
+fn expected_row_in_symbol(symbol: &IndexedSymbol, line_offset_in_symbol: u32) -> u32 {
+    symbol
+        .range
+        .start
+        .row
+        .saturating_add(line_offset_in_symbol)
+        .clamp(symbol.range.start.row, symbol_end_row(symbol))
+}
+
+fn symbol_end_row(symbol: &IndexedSymbol) -> u32 {
+    if symbol.range.end.column == 0 && symbol.range.end.row > symbol.range.start.row {
+        symbol.range.end.row - 1
+    } else {
+        symbol.range.end.row
     }
 }
 
@@ -403,20 +698,7 @@ impl BookmarkStore {
         let bookmarks: Vec<Bookmark> = bookmarks
             .iter()
             .filter_map(|bookmark| {
-                let point = Point::new(bookmark.row, 0);
-
-                if point > max_point {
-                    log::warn!(
-                        "Skipping out-of-range bookmark: {} row {} (file has {} rows)",
-                        abs_path.display(),
-                        bookmark.row,
-                        max_point.row
-                    );
-                    return None;
-                }
-
-                let anchor = snapshot.anchor_after(point);
-                let syntactic_location = bookmark
+                let saved_syntactic_location = bookmark
                     .syntactic_location
                     .as_ref()
                     .and_then(|location| match location.to_syntactic_location(bookmark.row) {
@@ -429,14 +711,49 @@ impl BookmarkStore {
                             );
                             None
                         }
-                    })
-                    .unwrap_or_else(|| {
-                        compute_syntactic_location_with_index(
+                    });
+
+                let resolved = saved_syntactic_location
+                    .as_ref()
+                    .and_then(|location| {
+                        resolve_syntactic_location(
                             &snapshot,
                             &syntactic_location_index,
-                            anchor,
+                            location,
                         )
+                    })
+                    .or_else(|| {
+                        (bookmark.row <= max_point.row).then_some(ResolvedBookmarkLocation {
+                            row: bookmark.row,
+                            resolution: BookmarkResolution::RowFallback,
+                        })
                     });
+                let Some(resolved) = resolved else {
+                    log::warn!(
+                        "Skipping out-of-range bookmark: {} row {} (file has {} rows)",
+                        abs_path.display(),
+                        bookmark.row,
+                        max_point.row
+                    );
+                    return None;
+                };
+
+                if saved_syntactic_location.is_some() {
+                    log::debug!(
+                        "Resolved syntactic bookmark at {} from row {} to row {} using {:?}",
+                        abs_path.display(),
+                        bookmark.row,
+                        resolved.row,
+                        resolved.resolution,
+                    );
+                }
+
+                let anchor = snapshot.anchor_after(Point::new(resolved.row, 0));
+                let syntactic_location = compute_syntactic_location_with_index(
+                    &snapshot,
+                    &syntactic_location_index,
+                    anchor,
+                );
                 Some(Bookmark {
                     anchor,
                     label: bookmark.label.clone(),
@@ -877,6 +1194,28 @@ mod tests {
         })
     }
 
+    fn resolve_location(
+        text: &str,
+        language: Option<Arc<Language>>,
+        location: &SyntacticLocation,
+        cx: &mut TestAppContext,
+    ) -> ResolvedBookmarkLocation {
+        let buffer = cx.new(|cx| {
+            let buffer = Buffer::local(text, cx);
+            if let Some(language) = language {
+                buffer.with_language(language, cx)
+            } else {
+                buffer
+            }
+        });
+        cx.update(|cx| {
+            let snapshot = buffer.read(cx).snapshot();
+            let index = SyntacticLocationIndex::new(&snapshot);
+            resolve_syntactic_location(&snapshot, &index, location)
+                .expect("expected the bookmark location to resolve")
+        })
+    }
+
     #[gpui::test]
     fn test_syntactic_location_inside_rust_function(cx: &mut TestAppContext) {
         let location = syntactic_location_at_row(
@@ -1049,6 +1388,201 @@ mod tests {
         assert_ne!(
             first.content_marker.context_hash,
             last.content_marker.context_hash
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_bookmark_after_lines_inserted_above_symbol(cx: &mut TestAppContext) {
+        let location =
+            syntactic_location_at_row("fn bookmarked() {\n    target();\n}\n", 1, true, cx);
+
+        let resolved = resolve_location(
+            "fn unrelated() {}\n\nfn bookmarked() {\n    target();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 3,
+                resolution: BookmarkResolution::ExactSymbol,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_bookmark_after_line_inserted_inside_symbol(cx: &mut TestAppContext) {
+        let location = syntactic_location_at_row(
+            "fn bookmarked() {\n    let before = 1;\n    target();\n}\n",
+            2,
+            true,
+            cx,
+        );
+
+        let resolved = resolve_location(
+            "fn bookmarked() {\n    let inserted = 0;\n    let before = 1;\n    target();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 3,
+                resolution: BookmarkResolution::SymbolContent,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_bookmark_after_symbol_rename(cx: &mut TestAppContext) {
+        let location =
+            syntactic_location_at_row("fn bookmarked() {\n    target();\n}\n", 1, true, cx);
+
+        let resolved = resolve_location(
+            "fn bookmark() {\n    target();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 1,
+                resolution: BookmarkResolution::FuzzySymbol,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_bookmark_when_duplicate_symbol_changes_ordinal(cx: &mut TestAppContext) {
+        let location = syntactic_location_at_row(
+            "fn duplicate() {\n    first();\n}\n\nfn duplicate() {\n    bookmarked();\n}\n",
+            5,
+            true,
+            cx,
+        );
+
+        let resolved = resolve_location(
+            "fn duplicate() {\n    inserted();\n}\n\nfn duplicate() {\n    first();\n}\n\nfn duplicate() {\n    bookmarked();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 9,
+                resolution: BookmarkResolution::SymbolContent,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_typescript_bookmark_after_method_moves(cx: &mut TestAppContext) {
+        let location = typescript_syntactic_location_at_row(
+            "class Store {\n    bookmarked(): void {\n        target();\n    }\n}\n",
+            2,
+            cx,
+        );
+
+        let resolved = resolve_location(
+            "function unrelated() {}\n\nclass Store {\n    bookmarked(): void {\n        const inserted = 1;\n        target();\n    }\n}\n",
+            Some(typescript_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 5,
+                resolution: BookmarkResolution::SymbolContent,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_plaintext_bookmark_from_content_context(cx: &mut TestAppContext) {
+        let location =
+            syntactic_location_at_row("prefix\nbefore\nbookmarked\nafter\nsuffix\n", 2, false, cx);
+
+        let resolved = resolve_location(
+            "unrelated\nprefix\nbefore\nbookmarked\nafter\nsuffix\n",
+            None,
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 3,
+                resolution: BookmarkResolution::ContentOnly,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_plaintext_content_without_matching_context_falls_back_to_row(cx: &mut TestAppContext) {
+        let location = syntactic_location_at_row("before\nbookmarked\nafter\n", 1, false, cx);
+
+        let resolved = resolve_location(
+            "replacement\nold row\nunrelated\nbookmarked\ndifferent\n",
+            None,
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 1,
+                resolution: BookmarkResolution::RowFallback,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_symbol_when_last_known_row_is_out_of_range(cx: &mut TestAppContext) {
+        let mut location =
+            syntactic_location_at_row("fn bookmarked() {\n    target();\n}\n", 1, true, cx);
+        location.last_known_row = 100;
+
+        let resolved = resolve_location(
+            "fn bookmarked() {\n    target();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(resolved.row, 1);
+        assert_ne!(resolved.resolution, BookmarkResolution::RowFallback);
+    }
+
+    #[gpui::test]
+    fn test_deleted_symbol_without_matching_content_falls_back_to_row(cx: &mut TestAppContext) {
+        let location =
+            syntactic_location_at_row("fn bookmarked() {\n    target();\n}\n", 1, true, cx);
+
+        let resolved = resolve_location(
+            "fn replacement() {\n    different();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 1,
+                resolution: BookmarkResolution::RowFallback,
+            }
         );
     }
 
