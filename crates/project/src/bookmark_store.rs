@@ -347,9 +347,13 @@ fn resolve_syntactic_location(
     location: &SyntacticLocation,
 ) -> Option<ResolvedBookmarkLocation> {
     if let Some(symbol) = location.symbol.as_ref() {
-        if let Some(resolved) =
-            resolve_exact_symbol(snapshot, index, symbol, &location.content_marker)
-        {
+        if let Some(resolved) = resolve_exact_symbol(
+            snapshot,
+            index,
+            symbol,
+            &location.content_marker,
+            location.last_known_row,
+        ) {
             return Some(resolved);
         }
 
@@ -360,7 +364,12 @@ fn resolve_syntactic_location(
         }
     }
 
-    if let Some(row) = resolve_content_only(snapshot, index, location) {
+    if let Some(row) = resolve_content_only(
+        snapshot,
+        index,
+        &location.content_marker,
+        location.last_known_row,
+    ) {
         return Some(ResolvedBookmarkLocation {
             row,
             resolution: BookmarkResolution::ContentOnly,
@@ -378,6 +387,7 @@ fn resolve_exact_symbol(
     index: &SyntacticLocationIndex,
     symbol: &SymbolRef,
     content_marker: &ContentMarker,
+    last_known_row: u32,
 ) -> Option<ResolvedBookmarkLocation> {
     let matching_symbols = index
         .symbols
@@ -465,7 +475,20 @@ fn resolve_exact_symbol(
         });
     }
 
-    preferred_symbol.map(|preferred_symbol| ResolvedBookmarkLocation {
+    let preferred_symbol = preferred_symbol?;
+
+    // Reaching this point with a non-empty content marker means the bookmarked
+    // line is no longer inside any symbol with the stored path, so before
+    // guessing a row positionally, check whether the exact line (confirmed by
+    // context hash) moved elsewhere in the file, e.g. into another symbol.
+    if let Some(row) = resolve_content_only(snapshot, index, content_marker, last_known_row) {
+        return Some(ResolvedBookmarkLocation {
+            row,
+            resolution: BookmarkResolution::ContentOnly,
+        });
+    }
+
+    Some(ResolvedBookmarkLocation {
         row: expected_row_in_symbol(preferred_symbol, symbol.line_offset_in_symbol),
         resolution: BookmarkResolution::ExactSymbol,
     })
@@ -513,21 +536,21 @@ fn resolve_fuzzy_symbol(
 fn resolve_content_only(
     snapshot: &language::BufferSnapshot,
     index: &SyntacticLocationIndex,
-    location: &SyntacticLocation,
+    content_marker: &ContentMarker,
+    last_known_row: u32,
 ) -> Option<u32> {
-    if location.content_marker.line_text.is_empty() {
+    if content_marker.line_text.is_empty() {
         return None;
     }
 
     index
-        .rows_matching_line(snapshot, &location.content_marker.line_text)
+        .rows_matching_line(snapshot, &content_marker.line_text)
         .iter()
         .copied()
         .filter(|row| {
-            compute_content_marker(snapshot, *row).context_hash
-                == location.content_marker.context_hash
+            compute_content_marker(snapshot, *row).context_hash == content_marker.context_hash
         })
-        .min_by_key(|row| row.abs_diff(location.last_known_row))
+        .min_by_key(|row| row.abs_diff(last_known_row))
 }
 
 #[derive(Clone, Copy)]
@@ -1479,6 +1502,56 @@ mod tests {
             ResolvedBookmarkLocation {
                 row: 9,
                 resolution: BookmarkResolution::SymbolContent,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolves_bookmark_when_line_moves_to_another_symbol(cx: &mut TestAppContext) {
+        let location = syntactic_location_at_row(
+            "fn alpha() {\n    one();\n    setup();\n    let marker = compute_unique_thing();\n    teardown();\n    two();\n}\n\nfn beta() {\n    other();\n}\n",
+            3,
+            true,
+            cx,
+        );
+
+        let resolved = resolve_location(
+            "fn alpha() {\n    filler();\n}\n\nfn beta() {\n    one();\n    setup();\n    let marker = compute_unique_thing();\n    teardown();\n    two();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 7,
+                resolution: BookmarkResolution::ContentOnly,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn test_symbol_without_matching_content_resolves_to_symbol_offset(cx: &mut TestAppContext) {
+        let location = syntactic_location_at_row(
+            "fn bookmarked() {\n    setup();\n    target();\n    teardown();\n}\n",
+            2,
+            true,
+            cx,
+        );
+
+        let resolved = resolve_location(
+            "fn bookmarked() {\n    setup();\n    replaced();\n    teardown();\n}\n",
+            Some(rust_lang()),
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 2,
+                resolution: BookmarkResolution::ExactSymbol,
             }
         );
     }
