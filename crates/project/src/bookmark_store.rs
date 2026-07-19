@@ -543,14 +543,19 @@ fn resolve_content_only(
         return None;
     }
 
-    index
-        .rows_matching_line(snapshot, &content_marker.line_text)
+    let matching_rows = index.rows_matching_line(snapshot, &content_marker.line_text);
+    let context_match = matching_rows
         .iter()
         .copied()
         .filter(|row| {
             compute_content_marker(snapshot, *row).context_hash == content_marker.context_hash
         })
-        .min_by_key(|row| row.abs_diff(last_known_row))
+        .min_by_key(|row| row.abs_diff(last_known_row));
+
+    context_match.or_else(|| match matching_rows {
+        [row] => Some(*row),
+        _ => None,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1602,11 +1607,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_plaintext_unique_line_survives_nearby_insertion(cx: &mut TestAppContext) {
+        let location = syntactic_location_at_row(
+            "before one\nbefore two\nbookmarked\nafter one\nafter two\n",
+            2,
+            false,
+            cx,
+        );
+
+        let resolved = resolve_location(
+            "before one\nbefore two\ninserted\nbookmarked\nafter one\nafter two\n",
+            None,
+            &location,
+            cx,
+        );
+
+        assert_eq!(
+            resolved,
+            ResolvedBookmarkLocation {
+                row: 3,
+                resolution: BookmarkResolution::ContentOnly,
+            }
+        );
+    }
+
+    #[gpui::test]
     fn test_plaintext_content_without_matching_context_falls_back_to_row(cx: &mut TestAppContext) {
         let location = syntactic_location_at_row("before\nbookmarked\nafter\n", 1, false, cx);
 
         let resolved = resolve_location(
-            "replacement\nold row\nunrelated\nbookmarked\ndifferent\n",
+            "replacement\nold row\nbookmarked\nunrelated\nbookmarked\ndifferent\n",
             None,
             &location,
             cx,
