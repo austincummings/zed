@@ -2,7 +2,6 @@ use std::{cell::OnceCell, collections::HashMap, ops::Range};
 
 use anyhow::{Context as _, Result};
 use gpui::SharedString;
-use itertools::Itertools;
 use sha2::{Digest, Sha256};
 use text::{BufferSnapshot, Point};
 
@@ -194,7 +193,6 @@ pub(crate) fn compute_syntactic_location_with_index(
 
 pub(crate) struct SyntacticLocationIndex {
     symbols: Vec<IndexedSymbol>,
-    outline: language::Outline<text::Anchor>,
     rows_by_line_text: OnceCell<HashMap<SharedString, Vec<u32>>>,
 }
 
@@ -229,7 +227,6 @@ impl SyntacticLocationIndex {
 
         Self {
             symbols,
-            outline,
             rows_by_line_text: OnceCell::new(),
         }
     }
@@ -319,7 +316,6 @@ fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker 
 pub(crate) enum BookmarkResolution {
     ExactSymbol,
     SymbolContent,
-    FuzzySymbol,
     ContentOnly,
     RowFallback,
 }
@@ -335,22 +331,16 @@ pub(crate) fn resolve_syntactic_location(
     index: &SyntacticLocationIndex,
     location: &SyntacticLocation,
 ) -> Option<ResolvedBookmarkLocation> {
-    if let Some(symbol) = location.symbol.as_ref() {
-        if let Some(resolved) = resolve_exact_symbol(
+    if let Some(symbol) = location.symbol.as_ref()
+        && let Some(resolved) = resolve_exact_symbol(
             snapshot,
             index,
             symbol,
             &location.content_marker,
             location.last_known_row,
-        ) {
-            return Some(resolved);
-        }
-
-        if let Some(resolved) =
-            resolve_fuzzy_symbol(snapshot, index, symbol, &location.content_marker)
-        {
-            return Some(resolved);
-        }
+        )
+    {
+        return Some(resolved);
     }
 
     if let Some(row) = resolve_content_only(
@@ -421,10 +411,6 @@ fn resolve_exact_symbol(
     }
 
     if let Some(resolved) = closest_line_match_in_preferred_symbol(&candidates) {
-        return Some(resolved);
-    }
-
-    if let Some(resolved) = unique_line_match_across_symbols(&candidates) {
         return Some(resolved);
     }
 
@@ -509,61 +495,6 @@ fn closest_line_match_in_preferred_symbol(
         } else {
             BookmarkResolution::SymbolContent
         },
-    })
-}
-
-/// When exactly one symbol occurrence contains exactly one line match, trust
-/// that line even though neither the ordinal nor the context hash matched.
-fn unique_line_match_across_symbols(
-    candidates: &[SymbolCandidate],
-) -> Option<ResolvedBookmarkLocation> {
-    let mut unique_matches = candidates
-        .iter()
-        .filter_map(|candidate| match candidate.line_matches.as_slice() {
-            [only_match] => Some(only_match.row),
-            _ => None,
-        });
-    let row = unique_matches.next()?;
-    if unique_matches.next().is_some() {
-        return None;
-    }
-    Some(ResolvedBookmarkLocation {
-        row,
-        resolution: BookmarkResolution::SymbolContent,
-    })
-}
-
-fn resolve_fuzzy_symbol(
-    snapshot: &language::BufferSnapshot,
-    index: &SyntacticLocationIndex,
-    symbol: &SymbolRef,
-    content_marker: &ContentMarker,
-) -> Option<ResolvedBookmarkLocation> {
-    if content_marker.line_text.is_empty() {
-        return None;
-    }
-
-    let query = symbol.symbol_path.iter().join(" ");
-    let (_, item) = index.outline.find_most_similar(&query)?;
-    let range =
-        item.range.start.summary::<Point>(snapshot)..item.range.end.summary::<Point>(snapshot);
-    let expected_row = expected_row_in_range(&range, symbol.line_offset_in_symbol);
-    let matches = content_matches_in_range(snapshot, &range, content_marker);
-    let row = matches
-        .iter()
-        .filter(|content_match| content_match.context_matches)
-        .min_by_key(|content_match| content_match.row.abs_diff(expected_row))
-        .map(|content_match| content_match.row)
-        .or_else(|| {
-            matches
-                .first()
-                .filter(|_| matches.len() == 1)
-                .map(|content_match| content_match.row)
-        })?;
-
-    Some(ResolvedBookmarkLocation {
-        row,
-        resolution: BookmarkResolution::FuzzySymbol,
     })
 }
 
@@ -956,7 +887,7 @@ mod tests {
             resolved,
             ResolvedBookmarkLocation {
                 row: 1,
-                resolution: BookmarkResolution::FuzzySymbol,
+                resolution: BookmarkResolution::ContentOnly,
             }
         );
     }
