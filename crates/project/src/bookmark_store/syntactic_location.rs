@@ -154,11 +154,12 @@ fn line_text(snapshot: &BufferSnapshot, row: u32) -> String {
 }
 
 fn syntax_lookup_point(snapshot: &BufferSnapshot, row: u32) -> Point {
-    let line = line_text(snapshot, row);
-    let column = line
-        .find(|character: char| !character.is_whitespace())
-        .unwrap_or(0);
-    let column = u32::try_from(column).unwrap_or(snapshot.line_len(row));
+    let indent = snapshot.line_indent_for_row(row);
+    let column = if indent.is_line_blank() {
+        0
+    } else {
+        indent.raw_len()
+    };
     Point::new(row, column)
 }
 
@@ -294,6 +295,12 @@ fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker 
     let max_row = snapshot.max_point().row;
     let start = row.saturating_sub(CONTEXT_WINDOW);
     let end = (row + CONTEXT_WINDOW).min(max_row);
+    // Hash the target row's offset within the window, not just the window's
+    // lines: near buffer boundaries the window is clamped, so two different
+    // rows (e.g. the first and last line of a three-line file with identical
+    // neighbors) can otherwise produce identical windows. The hash is
+    // persisted, so changing any of its inputs requires bumping
+    // [`SYNTACTIC_LOCATION_VERSION`].
     hasher.update((row - start).to_le_bytes());
     for context_row in start..=end {
         let context_line = normalize_line(&line_text(snapshot, context_row));
