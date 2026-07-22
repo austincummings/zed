@@ -208,7 +208,6 @@ fn compute_syntactic_location_with_index(
 }
 
 struct SyntacticLocationIndex {
-    ordinals: HashMap<(Point, Point, Vec<SharedString>), u32>,
     symbols: Vec<IndexedSymbol>,
     outline: language::Outline<text::Anchor>,
     rows_by_line_text: OnceCell<HashMap<SharedString, Vec<u32>>>,
@@ -225,7 +224,6 @@ impl SyntacticLocationIndex {
         let outline = snapshot.outline(None);
         let mut path_stack = Vec::new();
         let mut next_ordinal_by_path = HashMap::<Vec<SharedString>, u32>::new();
-        let mut ordinals = HashMap::with_capacity(outline.items.len());
         let mut symbols = Vec::with_capacity(outline.items.len());
 
         for item in &outline.items {
@@ -233,25 +231,29 @@ impl SyntacticLocationIndex {
             path_stack.push(item.text.clone());
             let symbol_path = path_stack.clone();
             let next_ordinal = next_ordinal_by_path.entry(symbol_path.clone()).or_default();
-            let ordinal = *next_ordinal;
+            let symbol_ordinal = *next_ordinal;
             *next_ordinal += 1;
 
-            let start = item.range.start.summary::<Point>(snapshot);
-            let end = item.range.end.summary::<Point>(snapshot);
-            ordinals.insert((start, end, symbol_path.clone()), ordinal);
             symbols.push(IndexedSymbol {
                 symbol_path,
-                symbol_ordinal: ordinal,
-                range: start..end,
+                symbol_ordinal,
+                range: item.range.start.summary::<Point>(snapshot)
+                    ..item.range.end.summary::<Point>(snapshot),
             });
         }
 
         Self {
-            ordinals,
             symbols,
             outline,
             rows_by_line_text: OnceCell::new(),
         }
+    }
+
+    fn ordinal_for(&self, range: &Range<Point>, symbol_path: &[SharedString]) -> Option<u32> {
+        self.symbols
+            .iter()
+            .find(|symbol| symbol.range == *range && symbol.symbol_path == symbol_path)
+            .map(|symbol| symbol.symbol_ordinal)
     }
 
     fn rows_matching_line(
@@ -288,14 +290,10 @@ fn compute_symbol_ref(
         .map(|item| item.text.clone())
         .collect::<Vec<_>>();
 
-    let symbol_start_row = innermost.range.start.summary::<Point>(snapshot).row;
-    let line_offset_in_symbol = row.saturating_sub(symbol_start_row);
-    let range_start = innermost.range.start.summary::<Point>(snapshot);
-    let range_end = innermost.range.end.summary::<Point>(snapshot);
-    let symbol_ordinal = index
-        .ordinals
-        .get(&(range_start, range_end, symbol_path.clone()))
-        .copied()?;
+    let range = innermost.range.start.summary::<Point>(snapshot)
+        ..innermost.range.end.summary::<Point>(snapshot);
+    let line_offset_in_symbol = row.saturating_sub(range.start.row);
+    let symbol_ordinal = index.ordinal_for(&range, &symbol_path)?;
 
     Some(SymbolRef {
         symbol_path,
