@@ -1,8 +1,8 @@
 use std::{cell::OnceCell, collections::HashMap, ops::Range};
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use gpui::SharedString;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use text::{BufferSnapshot, Point};
 
 /// Number of lines above and below the bookmarked line hashed into
@@ -50,35 +50,30 @@ pub struct ContentMarker {
     /// Hash of a normalized window of surrounding lines (±[`CONTEXT_WINDOW`]).
     /// A tiebreaker only, consulted when `line_text` is ambiguous within the
     /// search window.
-    pub context_hash: [u8; 32],
+    pub context_hash: u64,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SerializedSyntacticLocation {
     pub symbol: Option<SerializedSymbolRef>,
     pub content_marker: SerializedContentMarker,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SerializedSymbolRef {
     pub symbol_path: Vec<String>,
     pub symbol_ordinal: u32,
     pub line_offset_in_symbol: u32,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SerializedContentMarker {
     pub line_text: String,
-    pub context_hash: String,
+    pub context_hash: u64,
 }
 
 impl SerializedSyntacticLocation {
     pub fn validate(&self) -> Result<()> {
-        self.validated_context_hash()?;
-        Ok(())
-    }
-
-    fn validated_context_hash(&self) -> Result<[u8; 32]> {
         if self
             .symbol
             .as_ref()
@@ -86,19 +81,11 @@ impl SerializedSyntacticLocation {
         {
             anyhow::bail!("syntactic bookmark symbol path is empty");
         }
-        hex::decode(&self.content_marker.context_hash)
-            .context("invalid syntactic bookmark context hash")?
-            .try_into()
-            .map_err(|hash: Vec<u8>| {
-                anyhow::anyhow!(
-                    "invalid syntactic bookmark context hash length: expected 32 bytes, got {}",
-                    hash.len()
-                )
-            })
+        Ok(())
     }
 
     pub(crate) fn to_syntactic_location(&self, last_known_row: u32) -> Result<SyntacticLocation> {
-        let context_hash = self.validated_context_hash()?;
+        self.validate()?;
 
         Ok(SyntacticLocation {
             symbol: self.symbol.as_ref().map(|symbol| SymbolRef {
@@ -113,7 +100,7 @@ impl SerializedSyntacticLocation {
             }),
             content_marker: ContentMarker {
                 line_text: self.content_marker.line_text.clone().into(),
-                context_hash,
+                context_hash: self.content_marker.context_hash,
             },
             last_known_row,
         })
@@ -134,7 +121,7 @@ impl From<&SyntacticLocation> for SerializedSyntacticLocation {
             }),
             content_marker: SerializedContentMarker {
                 line_text: location.content_marker.line_text.to_string(),
-                context_hash: hex::encode(location.content_marker.context_hash),
+                context_hash: location.content_marker.context_hash,
             },
         }
     }
@@ -284,11 +271,32 @@ fn compute_symbol_ref(
     })
 }
 
+/// FNV-1a, implemented inline because the hash is persisted: it must remain
+/// stable across releases, which rules out `std`'s unspecified default hasher
+/// and third-party hashers that don't guarantee a fixed algorithm.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker {
     let normalized = normalize_line(&line_text(snapshot, row));
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"zed-syntactic-bookmark-context-v1\0");
+    let mut hasher = Fnv1a::new();
     let max_row = snapshot.max_point().row;
     let start = row.saturating_sub(CONTEXT_WINDOW);
     let end = (row + CONTEXT_WINDOW).min(max_row);
@@ -298,17 +306,17 @@ fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker 
     // neighbors) can otherwise produce identical windows. The hash is
     // persisted, so changing any of its inputs requires bumping
     // [`SYNTACTIC_LOCATION_VERSION`].
-    hasher.update((row - start).to_le_bytes());
+    hasher.update(&(row - start).to_le_bytes());
     for context_row in start..=end {
         let context_line = normalize_line(&line_text(snapshot, context_row));
         let line_length = u32::try_from(context_line.len()).unwrap_or(u32::MAX);
-        hasher.update(line_length.to_le_bytes());
+        hasher.update(&line_length.to_le_bytes());
         hasher.update(context_line.as_bytes());
     }
 
     ContentMarker {
         line_text: normalized.into(),
-        context_hash: hasher.finalize().into(),
+        context_hash: hasher.finish(),
     }
 }
 
@@ -804,10 +812,8 @@ mod tests {
             first.content_marker.context_hash,
             first_again.content_marker.context_hash
         );
-        assert_eq!(
-            hex::encode(first.content_marker.context_hash),
-            "735f2ddfccb8660f138e80c2bd5605f92ba444884fef30c08ef5f4c7afaf13a8"
-        );
+        // Pinned value: the hash is persisted, so it must stay stable.
+        assert_eq!(first.content_marker.context_hash, 5739249799607469836);
     }
 
     #[gpui::test]
@@ -1108,16 +1114,19 @@ mod tests {
             .expect("valid serialized syntactic location");
 
         assert_eq!(restored, location);
-        assert_eq!(serialized.content_marker.context_hash.len(), 64);
     }
 
     #[test]
-    fn test_serialized_syntactic_location_rejects_invalid_hash() {
+    fn test_serialized_syntactic_location_rejects_empty_symbol_path() {
         let serialized = SerializedSyntacticLocation {
-            symbol: None,
+            symbol: Some(SerializedSymbolRef {
+                symbol_path: Vec::new(),
+                symbol_ordinal: 0,
+                line_offset_in_symbol: 0,
+            }),
             content_marker: SerializedContentMarker {
                 line_text: "bookmarked".to_string(),
-                context_hash: "invalid".to_string(),
+                context_hash: 0,
             },
         };
 

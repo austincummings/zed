@@ -455,9 +455,7 @@ mod integration {
                     }),
                     content_marker: SerializedContentMarker {
                         line_text: "return;".to_string(),
-                        context_hash:
-                            "735f2ddfccb8660f138e80c2bd5605f92ba444884fef30c08ef5f4c7afaf13a8"
-                                .to_string(),
+                        context_hash: 42,
                     },
                 }),
             }],
