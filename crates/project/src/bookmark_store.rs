@@ -53,6 +53,13 @@ impl BufferBookmarks {
                 BufferEvent::FileHandleChanged => {
                     bookmark_store.handle_file_changed(buffer, cx);
                 }
+                // Serialized locations are recomputed from the buffer's
+                // outline whenever the workspace serializes. A serialize that
+                // runs before the buffer's language has been asynchronously
+                // assigned sees no outline and degrades the stored symbol
+                // data, so schedule another serialization once the language
+                // (and therefore the outline) is available.
+                BufferEvent::LanguageChanged(_) => cx.notify(),
                 _ => {}
             },
         );

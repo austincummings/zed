@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
 
 use collections::BTreeMap;
 use gpui::{Entity, TestAppContext};
@@ -464,6 +464,88 @@ mod integration {
         restore_bookmarks(&project, serialized.clone(), cx).await;
 
         assert_eq!(get_all_bookmarks(&project, cx), serialized);
+    }
+
+    #[gpui::test]
+    async fn test_symbol_data_recovers_after_language_loads(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file.rs": "fn bookmarked() {\n    target();\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let serialized = BTreeMap::from([(
+            project_path(path!("/project/file.rs")),
+            vec![SerializedBookmark {
+                row: 1,
+                label: String::new(),
+                syntactic_location: Some(SerializedSyntacticLocation {
+                    symbol: Some(SerializedSymbolRef {
+                        symbol_path: vec!["fn bookmarked".to_string()],
+                        symbol_ordinal: 0,
+                        line_offset_in_symbol: 1,
+                    }),
+                    content_marker: SerializedContentMarker {
+                        line_text: "target();".to_string(),
+                        context_hash: 42,
+                    },
+                }),
+            }],
+        )]);
+        restore_bookmarks(&project, serialized, cx).await;
+
+        // Resolving before the language is assigned mimics the editor querying
+        // bookmarks on its first render; serializing in that window loses the
+        // symbol data because the buffer has no outline yet.
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        resolve_bookmarks_for_buffer(&project, &buffer, cx);
+        let degraded = get_all_bookmarks(&project, cx);
+        let degraded_location = degraded
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should serialize without a language");
+        assert_eq!(degraded_location.symbol, None);
+
+        // Once the language arrives the store must notify so the workspace
+        // reserializes, and the recomputed location must include the symbol.
+        let notified = Rc::new(Cell::new(false));
+        let _observation = cx.update(|cx| {
+            let bookmark_store = project.read(cx).bookmark_store();
+            cx.observe(&bookmark_store, {
+                let notified = notified.clone();
+                move |_, _| notified.set(true)
+            })
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            notified.get(),
+            "bookmark store should notify when the buffer's language changes"
+        );
+        let healed = get_all_bookmarks(&project, cx);
+        let healed_location = healed
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should serialize with a language");
+        assert_eq!(
+            healed_location
+                .symbol
+                .as_ref()
+                .expect("symbol data should be recomputed once the outline exists")
+                .symbol_path,
+            vec!["fn bookmarked".to_string()]
+        );
     }
 
     #[gpui::test]
