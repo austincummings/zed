@@ -181,6 +181,7 @@ impl BookmarkStore {
                         )
                     })
                     .or_else(|| row_fallback(&snapshot, bookmark.row));
+
                 let Some(resolved) = resolved else {
                     log::warn!(
                         "Skipping out-of-range bookmark: {} row {} (file has {} rows)",

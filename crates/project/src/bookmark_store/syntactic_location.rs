@@ -366,7 +366,10 @@ pub(crate) fn resolve_syntactic_location(
     row_fallback(snapshot, location.last_known_row)
 }
 
-pub(crate) fn row_fallback(snapshot: &BufferSnapshot, row: u32) -> Option<ResolvedBookmarkLocation> {
+pub(crate) fn row_fallback(
+    snapshot: &BufferSnapshot,
+    row: u32,
+) -> Option<ResolvedBookmarkLocation> {
     (row <= snapshot.max_point().row).then_some(ResolvedBookmarkLocation {
         row,
         resolution: BookmarkResolution::RowFallback,

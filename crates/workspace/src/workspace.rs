@@ -1659,6 +1659,7 @@ impl Workspace {
             },
         )
         .detach();
+
         if let Some(toolchain_store) = project.read(cx).toolchain_store() {
             cx.subscribe_in(
                 &toolchain_store,

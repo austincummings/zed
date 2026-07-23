@@ -2836,7 +2836,6 @@ pub fn delete_unloaded_items(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use project::bookmark_store::{SerializedContentMarker, SerializedSymbolRef};
     use crate::PathList;
     use crate::ProjectGroupKey;
     use crate::RemovalIntent;
@@ -2851,6 +2850,7 @@ mod tests {
         },
     };
     use gpui::TaskExt;
+    use project::bookmark_store::{SerializedContentMarker, SerializedSymbolRef};
 
     use gpui::AppContext as _;
     use pretty_assertions::assert_eq;
