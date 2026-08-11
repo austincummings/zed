@@ -756,6 +756,119 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_openai_subscribed_prompt_cache_miss_notifies_agent(cx: &mut TestAppContext) {
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+    let model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "openai-subscribed",
+        "gpt-5.6-sol",
+        "GPT-5.6 Sol",
+        true,
+    ));
+    thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Message 1"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    model.send_last_completion_stream_text_chunk("Response 1");
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 1_024,
+            cache_read_input_tokens: 0,
+        },
+    ));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        let message = thread
+            .last_message()
+            .and_then(Message::as_agent_message)
+            .expect("expected an agent message");
+        assert_eq!(message.to_markdown(), "Response 1\n");
+        assert!(message.content.iter().any(|content| matches!(
+            content,
+            AgentMessageContent::PromptCacheMiss {
+                total_input_tokens: 1_124,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 1_024,
+            }
+        )));
+    });
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Message 2"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let request = model
+        .pending_completions()
+        .pop()
+        .expect("expected a pending completion");
+    assert!(request.messages.iter().any(|message| {
+        message.role == Role::Assistant
+            && message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    MessageContent::Text(text)
+                        if text.contains("indicating at least a partial prompt-cache miss")
+                )
+            })
+    }));
+}
+
+#[gpui::test]
+async fn test_openai_subscribed_prompt_cache_hit_does_not_notify_agent(cx: &mut TestAppContext) {
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+    let model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "openai-subscribed",
+        "gpt-5.6-sol",
+        "GPT-5.6 Sol",
+        true,
+    ));
+    thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Message 1"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    model.send_last_completion_stream_text_chunk("Response 1");
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_024,
+        },
+    ));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        let message = thread
+            .last_message()
+            .and_then(Message::as_agent_message)
+            .expect("expected an agent message");
+        assert!(
+            !message
+                .content
+                .iter()
+                .any(|content| matches!(content, AgentMessageContent::PromptCacheMiss { .. }))
+        );
+    });
+}
+
+#[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {
     let ThreadTest { thread, .. } = setup(cx, TestModel::Sonnet4).await;

@@ -601,6 +601,7 @@ impl AgentMessage {
                 AgentMessageContent::RedactedThinking(_) => {
                     markdown.push_str("<redacted_thinking />\n")
                 }
+                AgentMessageContent::PromptCacheMiss { .. } => {}
                 AgentMessageContent::ToolUse(tool_use) => {
                     markdown.push_str(&format!(
                         "**Tool Use**: {} (ID: {})\n",
@@ -677,6 +678,36 @@ impl AgentMessage {
                         language_model::MessageContent::RedactedThinking(value.clone()),
                     );
                 }
+                AgentMessageContent::PromptCacheMiss {
+                    total_input_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                } => {
+                    let notice = if *cache_creation_input_tokens > 0 {
+                        format!(
+                            "<runtime_notice>\n\
+                            Host diagnostic: The previous OpenAI Codex request read \
+                            {cache_read_input_tokens} prompt-cache tokens and wrote \
+                            {cache_creation_input_tokens} of {total_input_tokens} input tokens to \
+                            the prompt cache, indicating at least a partial prompt-cache miss. \
+                            Do not mention this diagnostic to the user unless it is relevant to \
+                            their request.\n\
+                            </runtime_notice>"
+                        )
+                    } else {
+                        format!(
+                            "<runtime_notice>\n\
+                            Host diagnostic: The previous OpenAI Codex request was eligible for \
+                            prompt caching but read 0 cached tokens out of {total_input_tokens} \
+                            input tokens, indicating a prompt-cache miss. Do not mention this \
+                            diagnostic to the user unless it is relevant to their request.\n\
+                            </runtime_notice>"
+                        )
+                    };
+                    assistant_message
+                        .content
+                        .push(language_model::MessageContent::Text(notice));
+                }
                 AgentMessageContent::ToolUse(tool_use) => {
                     if self.tool_results.contains_key(&tool_use.id) {
                         assistant_message
@@ -732,6 +763,11 @@ pub enum AgentMessageContent {
         signature: Option<String>,
     },
     RedactedThinking(String),
+    PromptCacheMiss {
+        total_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    },
     ToolUse(LanguageModelToolUse),
 }
 
@@ -1511,7 +1547,8 @@ impl Thread {
                             AgentMessageContent::Thinking { text, .. } => {
                                 stream.send_thinking(text)
                             }
-                            AgentMessageContent::RedactedThinking(_) => {}
+                            AgentMessageContent::RedactedThinking(_)
+                            | AgentMessageContent::PromptCacheMiss { .. } => {}
                             AgentMessageContent::ToolUse(tool_use) => {
                                 self.replay_tool_call(
                                     tool_use,
@@ -3392,6 +3429,7 @@ impl Thread {
                     cache_creation_input_tokens = usage.cache_creation_input_tokens,
                     cache_read_input_tokens = usage.cache_read_input_tokens,
                 );
+                self.record_prompt_cache_miss(usage);
                 // A successful compaction defers its telemetry until the first
                 // completion that follows it, so `tokens_after` reflects the
                 // real post-compaction context size.
@@ -3419,6 +3457,53 @@ impl Thread {
             last_message
                 .content
                 .push(AgentMessageContent::Text(new_text));
+        }
+    }
+
+    fn record_prompt_cache_miss(&mut self, usage: TokenUsage) {
+        let Some(model) = self.model() else {
+            return;
+        };
+        if model.provider_id().0.as_ref() != "openai-subscribed" {
+            return;
+        }
+
+        let total_input_tokens = total_input_tokens(usage);
+        let minimum_cacheable_tokens = if model.id().0.starts_with("gpt-5.6") {
+            1_024
+        } else {
+            // OpenAI documents a model-dependent 1,024–2,048 token minimum
+            // before GPT-5.6, so use the upper bound to avoid false positives.
+            2_048
+        };
+        let prompt_cache_missed = usage.cache_creation_input_tokens > 0
+            || (usage.cache_read_input_tokens == 0
+                && total_input_tokens >= minimum_cacheable_tokens);
+        if !prompt_cache_missed {
+            return;
+        }
+
+        let last_message = self.pending_message();
+        if let Some(AgentMessageContent::PromptCacheMiss {
+            total_input_tokens: current_total_input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        }) = last_message
+            .content
+            .iter_mut()
+            .find(|content| matches!(content, AgentMessageContent::PromptCacheMiss { .. }))
+        {
+            *current_total_input_tokens = total_input_tokens;
+            *cache_read_input_tokens = usage.cache_read_input_tokens;
+            *cache_creation_input_tokens = usage.cache_creation_input_tokens;
+        } else {
+            last_message
+                .content
+                .push(AgentMessageContent::PromptCacheMiss {
+                    total_input_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                });
         }
     }
 

@@ -616,6 +616,8 @@ pub struct ResponseUsage {
 pub struct ResponseInputTokensDetails {
     #[serde(default)]
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]

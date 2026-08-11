@@ -1488,14 +1488,16 @@ fn response_content_is_refusal(content: &serde_json::Value) -> bool {
 
 pub fn token_usage_from_response_usage(usage: &ResponsesUsage) -> TokenUsage {
     let cache_read_input_tokens = usage.input_tokens_details.cached_tokens;
+    let cache_creation_input_tokens = usage.input_tokens_details.cache_write_tokens;
 
     TokenUsage {
         input_tokens: usage
             .input_tokens
             .unwrap_or_default()
-            .saturating_sub(cache_read_input_tokens),
+            .saturating_sub(cache_read_input_tokens)
+            .saturating_sub(cache_creation_input_tokens),
         output_tokens: usage.output_tokens.unwrap_or_default(),
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens,
         cache_read_input_tokens,
     }
 }
@@ -1634,10 +1636,13 @@ mod tests {
             ResponsesStreamEvent::Completed {
                 response: ResponseSummary {
                     usage: Some(ResponseUsage {
-                        input_tokens: Some(5),
-                        input_tokens_details: ResponseInputTokensDetails { cached_tokens: 2 },
+                        input_tokens: Some(7),
+                        input_tokens_details: ResponseInputTokensDetails {
+                            cached_tokens: 2,
+                            cache_write_tokens: 3,
+                        },
                         output_tokens: Some(3),
-                        total_tokens: Some(8),
+                        total_tokens: Some(10),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1657,10 +1662,10 @@ mod tests {
         assert!(matches!(
             mapped[2],
             LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                input_tokens: 3,
+                input_tokens: 2,
                 output_tokens: 3,
+                cache_creation_input_tokens: 3,
                 cache_read_input_tokens: 2,
-                ..
             })
         ));
         assert!(matches!(
@@ -1686,26 +1691,27 @@ mod tests {
     }
 
     #[test]
-    fn response_usage_deserializes_cached_tokens() -> Result<()> {
+    fn response_usage_deserializes_cache_tokens() -> Result<()> {
         let usage: ResponseUsage = serde_json::from_value(json!({
-            "input_tokens": 5,
+            "input_tokens": 7,
             "input_tokens_details": {
                 "cached_tokens": 2,
+                "cache_write_tokens": 3,
             },
             "output_tokens": 3,
             "output_tokens_details": {
                 "reasoning_tokens": 1,
             },
-            "total_tokens": 8,
+            "total_tokens": 10,
         }))?;
 
         assert_eq!(usage.output_tokens_details.reasoning_tokens, 1);
         assert_eq!(
             token_usage_from_response_usage(&usage),
             TokenUsage {
-                input_tokens: 3,
+                input_tokens: 2,
                 output_tokens: 3,
-                cache_creation_input_tokens: 0,
+                cache_creation_input_tokens: 3,
                 cache_read_input_tokens: 2,
             }
         );
