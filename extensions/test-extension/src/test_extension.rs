@@ -6,9 +6,21 @@ use zed_extension_api::{self as zed, Result};
 
 struct TestExtension {
     cached_binary_path: Option<String>,
+    click_count: usize,
 }
 
 impl TestExtension {
+    fn counter_scene(&self) -> zed::ui::Scene {
+        zed::ui_scene!(
+            zed::ui::Node::column([
+                zed::ui::Node::label("Extension UI prototype"),
+                zed::ui::Node::label(format!("Button clicked {} times", self.click_count)),
+                zed::ui::Node::button("increment", "Increment", "increment"),
+            ])
+            .gap(12.0),
+        )
+    }
+
     fn language_server_binary_path(
         &mut self,
         language_server_id: &LanguageServerId,
@@ -136,6 +148,32 @@ impl zed::Extension for TestExtension {
     fn new() -> Self {
         Self {
             cached_binary_path: None,
+            click_count: 0,
+        }
+    }
+
+    fn render_ui_view(&mut self, view_id: &str, _instance_id: u64) -> Result<zed::ui::Scene> {
+        if view_id != "counter" {
+            return Err(format!("unknown UI view '{view_id}'"));
+        }
+        Ok(self.counter_scene())
+    }
+
+    fn handle_ui_view_event(
+        &mut self,
+        view_id: &str,
+        _instance_id: u64,
+        event: zed::ui::Event,
+    ) -> Result<zed::ui::SceneUpdate> {
+        if view_id != "counter" {
+            return Err(format!("unknown UI view '{view_id}'"));
+        }
+        match event.handler_id.as_str() {
+            "increment" => {
+                self.click_count += 1;
+                Ok(zed::ui::SceneUpdate::Replace(self.counter_scene()))
+            }
+            handler_id => Err(format!("unknown UI event handler '{handler_id}'")),
         }
     }
 

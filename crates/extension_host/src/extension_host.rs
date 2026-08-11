@@ -514,6 +514,13 @@ impl ExtensionStore {
             .map(|extension| &extension.manifest)
     }
 
+    pub fn wasm_extension_for_id(&self, extension_id: &str) -> Option<WasmExtension> {
+        self.wasm_extensions
+            .iter()
+            .find(|(manifest, _)| manifest.id.as_ref() == extension_id)
+            .map(|(_, extension)| extension.clone())
+    }
+
     /// Returns the names of themes provided by extensions.
     pub fn extension_themes<'a>(
         &'a self,

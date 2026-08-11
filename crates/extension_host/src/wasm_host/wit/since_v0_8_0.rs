@@ -88,6 +88,54 @@ impl From<Command> for extension::Command {
     }
 }
 
+impl TryFrom<ui::Scene> for extension::UiScene {
+    type Error = anyhow::Error;
+
+    fn try_from(scene: ui::Scene) -> Result<Self> {
+        Ok(Self {
+            roots: scene.roots,
+            nodes: scene
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    Ok(extension::UiNode {
+                        id: node.id,
+                        element: match node.element {
+                            ui::Element::Stack(stack) => extension::UiElement::Stack {
+                                axis: match stack.axis {
+                                    ui::Axis::Horizontal => extension::UiAxis::Horizontal,
+                                    ui::Axis::Vertical => extension::UiAxis::Vertical,
+                                },
+                                gap: stack.gap,
+                            },
+                            ui::Element::Label(label) => {
+                                extension::UiElement::Label { text: label.text }
+                            }
+                            ui::Element::Button(button) => extension::UiElement::Button {
+                                label: button.label,
+                                handler_id: button.handler_id,
+                                disabled: button.disabled,
+                            },
+                        },
+                        children: node.children,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
+impl TryFrom<ui::SceneUpdate> for extension::UiSceneUpdate {
+    type Error = anyhow::Error;
+
+    fn try_from(update: ui::SceneUpdate) -> Result<Self> {
+        Ok(match update {
+            ui::SceneUpdate::Unchanged => Self::Unchanged,
+            ui::SceneUpdate::Replace(scene) => Self::Replace(scene.try_into()?),
+        })
+    }
+}
+
 impl From<StartDebuggingRequestArgumentsRequest>
     for extension::StartDebuggingRequestArgumentsRequest
 {
@@ -624,6 +672,7 @@ impl HostWorktree for WasmState {
 }
 
 impl common::Host for WasmState {}
+impl ui::Host for WasmState {}
 
 impl http_client::Host for WasmState {
     async fn fetch(

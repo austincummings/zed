@@ -1,6 +1,7 @@
 mod components;
 mod extension_suggest;
 mod extension_version_selector;
+mod extension_view;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -103,6 +104,8 @@ fn update_rebuild_dev_extension_visibility(store: &Entity<ExtensionStore>, cx: &
 }
 
 pub fn init(cx: &mut App) {
+    extension_view::init(cx);
+
     let store = ExtensionStore::global(cx);
     update_rebuild_dev_extension_visibility(&store, cx);
     cx.observe(&store, |store, cx| {

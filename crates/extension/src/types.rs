@@ -2,6 +2,7 @@ mod context_server;
 mod dap;
 mod lsp;
 mod slash_command;
+mod ui;
 
 use std::{ops::Range, path::PathBuf};
 
@@ -11,6 +12,7 @@ pub use context_server::*;
 pub use dap::*;
 pub use lsp::*;
 pub use slash_command::*;
+pub use ui::*;
 
 /// A list of environment variables.
 pub type EnvVars = Vec<(String, String)>;

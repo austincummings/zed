@@ -1,0 +1,47 @@
+interface ui {
+    enum axis {
+        horizontal,
+        vertical,
+    }
+
+    record stack {
+        axis: axis,
+        gap: f32,
+    }
+
+    record label {
+        text: string,
+    }
+
+    record button {
+        label: string,
+        handler-id: string,
+        disabled: bool,
+    }
+
+    variant element {
+        stack(stack),
+        label(label),
+        button(button),
+    }
+
+    record node {
+        id: option<string>,
+        element: element,
+        children: list<u32>,
+    }
+
+    record scene {
+        roots: list<u32>,
+        nodes: list<node>,
+    }
+
+    record event {
+        handler-id: string,
+    }
+
+    variant scene-update {
+        unchanged,
+        replace(scene),
+    }
+}

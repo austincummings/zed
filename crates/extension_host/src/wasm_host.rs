@@ -9,7 +9,7 @@ use extension::{
     CodeLabel, Command, Completion, ContextServerConfiguration, DebugAdapterBinary,
     DebugTaskDefinition, ExtensionCapability, ExtensionHostProxy, KeyValueStoreDelegate,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput, Symbol,
-    WorktreeDelegate,
+    UiEvent, UiScene, UiSceneUpdate, WorktreeDelegate,
 };
 use fs::Fs;
 use futures::future::LocalBoxFuture;
@@ -342,6 +342,35 @@ impl extension::Extension for WasmExtension {
                     .map_err(|err| store.data().extension_error(err))?;
 
                 Ok(output.into())
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn render_ui_view(&self, view_id: Arc<str>, instance_id: u64) -> Result<UiScene> {
+        self.call(move |extension, store| {
+            async move {
+                extension
+                    .call_render_ui_view(store, &view_id, instance_id)
+                    .await
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn handle_ui_view_event(
+        &self,
+        view_id: Arc<str>,
+        instance_id: u64,
+        event: UiEvent,
+    ) -> Result<UiSceneUpdate> {
+        self.call(move |extension, store| {
+            async move {
+                extension
+                    .call_handle_ui_view_event(store, &view_id, instance_id, event)
+                    .await
             }
             .boxed()
         })

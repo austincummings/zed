@@ -130,6 +130,15 @@ pub trait Extension: Send + Sync + 'static {
         worktree: Option<Arc<dyn WorktreeDelegate>>,
     ) -> Result<SlashCommandOutput>;
 
+    async fn render_ui_view(&self, view_id: Arc<str>, instance_id: u64) -> Result<UiScene>;
+
+    async fn handle_ui_view_event(
+        &self,
+        view_id: Arc<str>,
+        instance_id: u64,
+        event: UiEvent,
+    ) -> Result<UiSceneUpdate>;
+
     async fn context_server_command(
         &self,
         context_server_id: Arc<str>,

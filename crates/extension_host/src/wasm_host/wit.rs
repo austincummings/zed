@@ -9,7 +9,9 @@ mod since_v0_5_0;
 mod since_v0_6_0;
 mod since_v0_8_0;
 use dap::DebugRequest;
-use extension::{DebugTaskDefinition, KeyValueStoreDelegate, WorktreeDelegate};
+use extension::{
+    DebugTaskDefinition, KeyValueStoreDelegate, UiEvent, UiScene, UiSceneUpdate, WorktreeDelegate,
+};
 use gpui::BackgroundExecutor;
 use language::LanguageName;
 use lsp::LanguageServerName;
@@ -1265,6 +1267,64 @@ impl Extension {
             | Extension::V0_0_4(_)
             | Extension::V0_0_1(_) => {
                 anyhow::bail!("`run_dap_locator` not available prior to v0.6.0");
+            }
+        }
+    }
+
+    pub async fn call_render_ui_view(
+        &self,
+        store: &mut Store<WasmState>,
+        view_id: &str,
+        instance_id: u64,
+    ) -> Result<UiScene> {
+        match self {
+            Extension::V0_8_0(extension) => extension
+                .call_render_ui_view(store, view_id, instance_id)
+                .await?
+                .map_err(|error| anyhow!(error))?
+                .try_into(),
+            Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => {
+                anyhow::bail!("extension UI is not available prior to v0.8.0");
+            }
+        }
+    }
+
+    pub async fn call_handle_ui_view_event(
+        &self,
+        store: &mut Store<WasmState>,
+        view_id: &str,
+        instance_id: u64,
+        event: UiEvent,
+    ) -> Result<UiSceneUpdate> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                let event = latest::ui::Event {
+                    handler_id: event.handler_id,
+                };
+                extension
+                    .call_handle_ui_view_event(store, view_id, instance_id, &event)
+                    .await?
+                    .map_err(|error| anyhow!(error))?
+                    .try_into()
+            }
+            Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => {
+                anyhow::bail!("extension UI is not available prior to v0.8.0");
             }
         }
     }

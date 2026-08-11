@@ -3,6 +3,7 @@
 pub mod http_client;
 pub mod process;
 pub mod settings;
+pub mod ui;
 
 use core::fmt;
 
@@ -71,6 +72,21 @@ pub trait Extension: Send + Sync {
     fn new() -> Self
     where
         Self: Sized;
+
+    /// Renders a UI view provided by the extension.
+    fn render_ui_view(&mut self, _view_id: &str, _instance_id: u64) -> Result<ui::Scene> {
+        Err("`render_ui_view` not implemented".to_string())
+    }
+
+    /// Handles an event from a UI view provided by the extension.
+    fn handle_ui_view_event(
+        &mut self,
+        _view_id: &str,
+        _instance_id: u64,
+        _event: ui::Event,
+    ) -> Result<ui::SceneUpdate> {
+        Err("`handle_ui_view_event` not implemented".to_string())
+    }
 
     /// Returns the command used to start the language server for the specified
     /// language.
@@ -364,6 +380,31 @@ wit::export!(Component);
 struct Component;
 
 impl wit::Guest for Component {
+    fn render_ui_view(
+        view_id: String,
+        instance_id: u64,
+    ) -> Result<wit::zed::extension::ui::Scene, String> {
+        extension()
+            .render_ui_view(&view_id, instance_id)?
+            .into_wit()
+    }
+
+    fn handle_ui_view_event(
+        view_id: String,
+        instance_id: u64,
+        event: wit::zed::extension::ui::Event,
+    ) -> Result<wit::zed::extension::ui::SceneUpdate, String> {
+        extension()
+            .handle_ui_view_event(
+                &view_id,
+                instance_id,
+                ui::Event {
+                    handler_id: event.handler_id,
+                },
+            )?
+            .into_wit()
+    }
+
     fn language_server_command(
         language_server_id: String,
         worktree: &wit::Worktree,

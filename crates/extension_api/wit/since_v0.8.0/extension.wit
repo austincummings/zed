@@ -15,9 +15,16 @@ world extension {
     use lsp.{completion, symbol};
     use process.{command};
     use slash-command.{slash-command, slash-command-argument-completion, slash-command-output};
+    use ui.{event, scene, scene-update};
 
     /// Initializes the extension.
     export init-extension: func();
+
+    /// Renders a UI view provided by the extension.
+    export render-ui-view: func(view-id: string, instance-id: u64) -> result<scene, string>;
+
+    /// Handles an event from a UI view provided by the extension.
+    export handle-ui-view-event: func(view-id: string, instance-id: u64, event: event) -> result<scene-update, string>;
 
     /// The type of a downloaded file.
     enum downloaded-file-type {
