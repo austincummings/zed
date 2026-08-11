@@ -58,7 +58,6 @@ git.workspace = true
 git_hosting_providers.workspace = true
 globset.workspace = true
 gpui.workspace = true
-hex.workspace = true
 http_client = { workspace = true, features = ["github-download"] }
 image.workspace = true
 indexmap.workspace = true
@@ -129,7 +128,6 @@ unindent.workspace = true
 util = { workspace = true, features = ["test-support"] }
 worktree = { workspace = true, features = ["test-support"] }
 remote = { workspace = true, features = ["test-support"] }
-tree-sitter-typescript.workspace = true
 
 [package.metadata.cargo-machete]
 ignored = ["tracing"]
