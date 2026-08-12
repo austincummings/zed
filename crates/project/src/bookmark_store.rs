@@ -11,7 +11,7 @@ use anyhow::Result;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::FuturesUnordered};
 use gpui::{App, AppContext, Context, Entity, Subscription, Task};
 use itertools::Itertools;
-use language::{Buffer, BufferEvent};
+use language::{Buffer, BufferEvent, PLAIN_TEXT, ParseStatus};
 use text::{BufferSnapshot, Point};
 
 pub use syntactic_location::{
@@ -29,6 +29,13 @@ use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStor
 pub struct Bookmark {
     pub anchor: text::Anchor,
     pub label: String,
+    pending_syntactic_location: Option<PendingSyntacticLocation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSyntacticLocation {
+    last_known_row: u32,
+    location: SerializedSyntacticLocation,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,6 +49,7 @@ pub struct SerializedBookmark {
 pub struct BufferBookmarks {
     buffer: Entity<Buffer>,
     bookmarks: Vec<Bookmark>,
+    needs_reserialization_after_reparse: bool,
     _subscription: Subscription,
 }
 
@@ -53,13 +61,12 @@ impl BufferBookmarks {
                 BufferEvent::FileHandleChanged => {
                     bookmark_store.handle_file_changed(buffer, cx);
                 }
-                // Serialized locations are recomputed from the buffer's
-                // outline whenever the workspace serializes. A serialize that
-                // runs before the buffer's language has been asynchronously
-                // assigned sees no outline and degrades the stored symbol
-                // data, so schedule another serialization once the language
-                // (and therefore the outline) is available.
-                BufferEvent::LanguageChanged(_) => cx.notify(),
+                BufferEvent::LanguageChanged(_) => {
+                    bookmark_store.handle_language_changed(buffer, cx);
+                }
+                BufferEvent::Reparsed => {
+                    bookmark_store.handle_reparsed(buffer, cx);
+                }
                 _ => {}
             },
         );
@@ -67,6 +74,7 @@ impl BufferBookmarks {
         Self {
             buffer,
             bookmarks: Vec::new(),
+            needs_reserialization_after_reparse: false,
             _subscription: subscription,
         }
     }
@@ -152,10 +160,23 @@ impl BookmarkStore {
         let snapshot = buffer.read(cx).snapshot();
         let max_point = snapshot.max_point();
         let syntactic_location_index = SyntacticLocationIndex::new(&snapshot);
+        let mut parse_status = buffer.read(cx).parse_status();
+        let is_parsing = *parse_status.borrow() == ParseStatus::Parsing;
+        let syntax_is_unavailable = snapshot
+            .language()
+            .is_none_or(|language| language == &*PLAIN_TEXT);
 
         let bookmarks: Vec<Bookmark> = bookmarks
             .iter()
             .filter_map(|bookmark| {
+                let pending_syntactic_location =
+                    bookmark.syntactic_location.as_ref().and_then(|location| {
+                        (is_parsing || syntax_is_unavailable && location.symbol.is_some())
+                            .then(|| PendingSyntacticLocation {
+                                last_known_row: bookmark.row,
+                                location: location.clone(),
+                            })
+                    });
                 let saved_syntactic_location = bookmark
                     .syntactic_location
                     .as_ref()
@@ -171,16 +192,20 @@ impl BookmarkStore {
                         }
                     });
 
-                let resolved = saved_syntactic_location
-                    .as_ref()
-                    .and_then(|location| {
-                        resolve_syntactic_location(
-                            &snapshot,
-                            &syntactic_location_index,
-                            location,
-                        )
-                    })
-                    .or_else(|| row_fallback(&snapshot, bookmark.row));
+                let resolved = if pending_syntactic_location.is_some() {
+                    row_fallback(&snapshot, bookmark.row.min(max_point.row))
+                } else {
+                    saved_syntactic_location
+                        .as_ref()
+                        .and_then(|location| {
+                            resolve_syntactic_location(
+                                &snapshot,
+                                &syntactic_location_index,
+                                location,
+                            )
+                        })
+                        .or_else(|| row_fallback(&snapshot, bookmark.row))
+                };
 
                 let Some(resolved) = resolved else {
                     log::warn!(
@@ -205,6 +230,7 @@ impl BookmarkStore {
                 Some(Bookmark {
                     anchor: snapshot.anchor_after(Point::new(resolved.row, 0)),
                     label: bookmark.label.clone(),
+                    pending_syntactic_location,
                 })
             })
             .collect();
@@ -263,7 +289,11 @@ impl BookmarkStore {
                 self.bookmarks.remove(&abs_path);
             }
         } else {
-            buffer_bookmarks.bookmarks.push(Bookmark { anchor, label });
+            buffer_bookmarks.bookmarks.push(Bookmark {
+                anchor,
+                label,
+                pending_syntactic_location: None,
+            });
         }
 
         cx.notify();
@@ -417,6 +447,104 @@ impl BookmarkStore {
         }
     }
 
+    fn handle_language_changed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let (has_language, is_parsing) = {
+            let buffer = buffer.read(cx);
+            let mut parse_status = buffer.parse_status();
+            (
+                buffer.language().is_some(),
+                *parse_status.borrow() == ParseStatus::Parsing,
+            )
+        };
+        if !has_language {
+            return;
+        }
+        if is_parsing {
+            if let Some(buffer_bookmarks) = self.buffer_bookmarks_mut(&buffer) {
+                buffer_bookmarks.needs_reserialization_after_reparse = true;
+            }
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn handle_reparsed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let (syntax_is_available, is_parsing) = {
+            let buffer = buffer.read(cx);
+            let mut parse_status = buffer.parse_status();
+            (
+                buffer
+                    .language()
+                    .is_some_and(|language| language != &*PLAIN_TEXT),
+                *parse_status.borrow() == ParseStatus::Parsing,
+            )
+        };
+        if !syntax_is_available || is_parsing {
+            return;
+        }
+        let Some(buffer_bookmarks) = self.buffer_bookmarks_mut(&buffer) else {
+            return;
+        };
+        let should_notify = buffer_bookmarks.needs_reserialization_after_reparse
+            || buffer_bookmarks
+                .bookmarks
+                .iter()
+                .any(|bookmark| bookmark.pending_syntactic_location.is_some());
+        buffer_bookmarks.needs_reserialization_after_reparse = false;
+
+        if should_notify {
+            self.resolve_pending_syntactic_locations(&buffer, cx);
+            cx.notify();
+        }
+    }
+
+    fn resolve_pending_syntactic_locations(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = buffer.read(cx).snapshot();
+        let syntactic_location_index = SyntacticLocationIndex::new(&snapshot);
+        let Some(buffer_bookmarks) = self.buffer_bookmarks_mut(buffer) else {
+            return;
+        };
+
+        buffer_bookmarks.bookmarks.retain_mut(|bookmark| {
+            let Some(pending) = bookmark.pending_syntactic_location.take() else {
+                return true;
+            };
+            let resolved = match pending
+                .location
+                .to_syntactic_location(pending.last_known_row)
+            {
+                Ok(location) => {
+                    resolve_syntactic_location(&snapshot, &syntactic_location_index, &location)
+                }
+                Err(error) => {
+                    log::warn!("Ignoring invalid pending syntactic bookmark location: {error:#}");
+                    row_fallback(&snapshot, pending.last_known_row)
+                }
+            };
+            let Some(resolved) = resolved else {
+                return false;
+            };
+            bookmark.anchor = snapshot.anchor_after(Point::new(resolved.row, 0));
+            true
+        });
+    }
+
+    fn buffer_bookmarks_mut(&mut self, buffer: &Entity<Buffer>) -> Option<&mut BufferBookmarks> {
+        let entity_id = buffer.entity_id();
+        self.bookmarks.values_mut().find_map(|entry| match entry {
+            BookmarkEntry::Loaded(buffer_bookmarks)
+                if buffer_bookmarks.buffer.entity_id() == entity_id =>
+            {
+                Some(buffer_bookmarks)
+            }
+            BookmarkEntry::Loaded(_) | BookmarkEntry::Unloaded(_) => None,
+        })
+    }
+
     pub fn all_serialized_bookmarks(
         &self,
         cx: &App,
@@ -435,6 +563,13 @@ impl BookmarkStore {
                             .filter_map(|bookmark| {
                                 if !snapshot.can_resolve(&bookmark.anchor) {
                                     return None;
+                                }
+                                if let Some(pending) = &bookmark.pending_syntactic_location {
+                                    return Some(SerializedBookmark {
+                                        row: pending.last_known_row,
+                                        label: bookmark.label.clone(),
+                                        syntactic_location: Some(pending.location.clone()),
+                                    });
                                 }
                                 let row =
                                     snapshot.summary_for_anchor::<Point>(&bookmark.anchor).row;
