@@ -22,8 +22,9 @@ use db::{
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::{
     ProjectGroupKey,
-    bookmark_store::{SYNTACTIC_LOCATION_VERSION, SerializedBookmark, SerializedSyntacticLocation},
+    bookmark_store::SerializedBookmark,
     debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
+    durable_source_location::{SYNTACTIC_LOCATION_VERSION, SerializedSyntacticLocation},
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
 
@@ -2850,7 +2851,7 @@ mod tests {
         },
     };
     use gpui::TaskExt;
-    use project::bookmark_store::{SerializedContentMarker, SerializedSymbolRef};
+    use project::durable_source_location::{SerializedContentMarker, SerializedSymbolRef};
 
     use gpui::AppContext as _;
     use pretty_assertions::assert_eq;

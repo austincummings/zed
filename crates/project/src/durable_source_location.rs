@@ -2,23 +2,22 @@ use std::{cell::OnceCell, collections::HashMap, ops::Range};
 
 use anyhow::Result;
 use gpui::SharedString;
+use language::{Buffer, PLAIN_TEXT, ParseStatus};
 use serde::{Deserialize, Serialize};
 use text::{BufferSnapshot, Point};
 
-/// Number of lines above and below the bookmarked line hashed into
+/// Number of lines above and below the source line hashed into
 /// [`ContentMarker::context_hash`].
 const CONTEXT_WINDOW: u32 = 2;
 pub const SYNTACTIC_LOCATION_VERSION: u32 = 1;
 
-/// A durable, serializable description of where a bookmark should be placed,
+/// A durable, serializable description of a source location,
 /// re-resolved against a buffer's outline at open/reload time.
 ///
 /// Unlike [`text::Anchor`], this does not track edits in a live buffer; it is
-/// re-resolved from scratch. While a buffer is open the live anchor is the
-/// source of truth, and this description is only consulted when reattaching a
-/// bookmark to a freshly opened buffer.
+/// re-resolved from scratch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SyntacticLocation {
+struct SyntacticLocation {
     /// `None` when there is no enclosing symbol — either the language has no
     /// parser/outline (e.g. plaintext), or the position sits between symbols.
     pub symbol: Option<SymbolRef>,
@@ -27,24 +26,24 @@ pub struct SyntacticLocation {
     pub last_known_row: u32,
 }
 
-/// Identifies the symbol a bookmark is bound to, plus where inside it the
-/// bookmark sits.
+/// Identifies the symbol a source location is bound to, plus its position
+/// within that symbol.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SymbolRef {
+struct SymbolRef {
     /// Outline path of the enclosing symbol, innermost last.
     pub symbol_path: Vec<SharedString>,
     /// The nth occurrence (0-based) of an identical `symbol_path` in the file,
     /// used to disambiguate paths that collapse to the same text.
     pub symbol_ordinal: u32,
-    /// Line offset from the symbol's start row to the bookmarked row.
+    /// Line offset from the symbol's start row to the source location's row.
     pub line_offset_in_symbol: u32,
 }
 
-/// A fingerprint of the bookmarked line and its surroundings, used to snap a
-/// bookmark back to the exact line when the symbol-relative offset drifts.
+/// A fingerprint of a source line and its surroundings, used to find the exact
+/// line when the symbol-relative offset drifts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ContentMarker {
-    /// Trimmed, whitespace-normalized text of the bookmarked line. The primary
+struct ContentMarker {
+    /// Trimmed, whitespace-normalized text of the source line. The primary
     /// matcher when snapping the offset to the exact line.
     pub line_text: SharedString,
     /// Hash of a normalized window of surrounding lines (±[`CONTEXT_WINDOW`]).
@@ -72,6 +71,184 @@ pub struct SerializedContentMarker {
     pub context_hash: u64,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SerializedSourceLocation {
+    pub row: u32,
+    pub syntactic_location: Option<SerializedSyntacticLocation>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DurableSourceLocation {
+    anchor: text::Anchor,
+    pending: Option<SerializedSourceLocation>,
+}
+
+pub struct DurableSourceLocationContext {
+    snapshot: language::BufferSnapshot,
+    syntactic_location_index: SyntacticLocationIndex,
+    syntax_state: SyntaxState,
+}
+
+#[derive(Clone, Copy)]
+enum SyntaxState {
+    Unavailable,
+    Parsing,
+    Ready,
+}
+
+impl DurableSourceLocationContext {
+    pub fn for_buffer(buffer: &Buffer) -> Self {
+        let snapshot = buffer.snapshot();
+        let mut parse_status = buffer.parse_status();
+        let syntax_state = if *parse_status.borrow() == ParseStatus::Parsing {
+            SyntaxState::Parsing
+        } else if snapshot
+            .language()
+            .is_none_or(|language| language == &*PLAIN_TEXT)
+        {
+            SyntaxState::Unavailable
+        } else {
+            SyntaxState::Ready
+        };
+
+        Self {
+            syntactic_location_index: SyntacticLocationIndex::new(&snapshot),
+            snapshot,
+            syntax_state,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self.syntax_state, SyntaxState::Ready)
+    }
+
+    pub fn max_row(&self) -> u32 {
+        self.snapshot.max_point().row
+    }
+}
+
+impl DurableSourceLocation {
+    pub fn from_anchor(anchor: text::Anchor) -> Self {
+        Self {
+            anchor,
+            pending: None,
+        }
+    }
+
+    pub fn restore(
+        serialized: SerializedSourceLocation,
+        context: &DurableSourceLocationContext,
+    ) -> Option<Self> {
+        let should_defer = serialized
+            .syntactic_location
+            .as_ref()
+            .is_some_and(|location| {
+                matches!(context.syntax_state, SyntaxState::Parsing)
+                    || matches!(context.syntax_state, SyntaxState::Unavailable)
+                        && location.symbol.is_some()
+            });
+
+        let resolved = if should_defer {
+            row_fallback(
+                &context.snapshot,
+                serialized.row.min(context.snapshot.max_point().row),
+            )
+        } else {
+            let syntactic_location = serialized.syntactic_location.as_ref().and_then(|location| {
+                match location.to_syntactic_location(serialized.row) {
+                    Ok(location) => Some(location),
+                    Err(error) => {
+                        log::warn!("Ignoring invalid durable source location: {error:#}");
+                        None
+                    }
+                }
+            });
+            syntactic_location
+                .as_ref()
+                .and_then(|location| {
+                    resolve_syntactic_location(
+                        &context.snapshot,
+                        &context.syntactic_location_index,
+                        location,
+                    )
+                })
+                .or_else(|| row_fallback(&context.snapshot, serialized.row))
+        }?;
+
+        Some(Self {
+            anchor: context.snapshot.anchor_after(Point::new(resolved.row, 0)),
+            pending: should_defer.then_some(serialized),
+        })
+    }
+
+    pub fn anchor(&self) -> text::Anchor {
+        self.anchor
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn resolve_pending(&mut self, context: &DurableSourceLocationContext) -> bool {
+        if !context.is_ready() {
+            return true;
+        }
+        let Some(pending) = self.pending.take() else {
+            return true;
+        };
+
+        let resolved = match pending
+            .syntactic_location
+            .as_ref()
+            .map(|location| location.to_syntactic_location(pending.row))
+            .transpose()
+        {
+            Ok(Some(location)) => resolve_syntactic_location(
+                &context.snapshot,
+                &context.syntactic_location_index,
+                &location,
+            ),
+            Ok(None) => row_fallback(&context.snapshot, pending.row),
+            Err(error) => {
+                log::warn!("Ignoring invalid pending durable source location: {error:#}");
+                row_fallback(&context.snapshot, pending.row)
+            }
+        };
+        let Some(resolved) = resolved else {
+            return false;
+        };
+
+        self.anchor = context.snapshot.anchor_after(Point::new(resolved.row, 0));
+        true
+    }
+
+    pub fn serialize(
+        &self,
+        context: &DurableSourceLocationContext,
+    ) -> Option<SerializedSourceLocation> {
+        if let Some(pending) = &self.pending {
+            return Some(pending.clone());
+        }
+        if !context.snapshot.can_resolve(&self.anchor) {
+            return None;
+        }
+
+        let row = context
+            .snapshot
+            .summary_for_anchor::<Point>(&self.anchor)
+            .row;
+        let syntactic_location = compute_syntactic_location_with_index(
+            &context.snapshot,
+            &context.syntactic_location_index,
+            self.anchor,
+        );
+        Some(SerializedSourceLocation {
+            row,
+            syntactic_location: Some((&syntactic_location).into()),
+        })
+    }
+}
+
 impl SerializedSyntacticLocation {
     pub fn validate(&self) -> Result<()> {
         if self
@@ -79,12 +256,12 @@ impl SerializedSyntacticLocation {
             .as_ref()
             .is_some_and(|symbol| symbol.symbol_path.is_empty())
         {
-            anyhow::bail!("syntactic bookmark symbol path is empty");
+            anyhow::bail!("syntactic source location symbol path is empty");
         }
         Ok(())
     }
 
-    pub(crate) fn to_syntactic_location(&self, last_known_row: u32) -> Result<SyntacticLocation> {
+    fn to_syntactic_location(&self, last_known_row: u32) -> Result<SyntacticLocation> {
         self.validate()?;
 
         Ok(SyntacticLocation {
@@ -161,7 +338,7 @@ fn compute_syntactic_location(
     compute_syntactic_location_with_index(snapshot, &index, anchor)
 }
 
-pub(crate) fn compute_syntactic_location_with_index(
+fn compute_syntactic_location_with_index(
     snapshot: &language::BufferSnapshot,
     index: &SyntacticLocationIndex,
     anchor: text::Anchor,
@@ -178,7 +355,7 @@ pub(crate) fn compute_syntactic_location_with_index(
     }
 }
 
-pub(crate) struct SyntacticLocationIndex {
+struct SyntacticLocationIndex {
     symbols: Vec<IndexedSymbol>,
     rows_by_line_text: OnceCell<HashMap<SharedString, Vec<u32>>>,
 }
@@ -190,7 +367,7 @@ struct IndexedSymbol {
 }
 
 impl SyntacticLocationIndex {
-    pub(crate) fn new(snapshot: &language::BufferSnapshot) -> Self {
+    fn new(snapshot: &language::BufferSnapshot) -> Self {
         let outline = snapshot.outline(None);
         let mut path_stack = Vec::new();
         let mut next_ordinal_by_path = HashMap::<Vec<SharedString>, u32>::new();
@@ -321,7 +498,7 @@ fn compute_content_marker(snapshot: &BufferSnapshot, row: u32) -> ContentMarker 
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BookmarkResolution {
+enum SourceLocationResolution {
     ExactSymbol,
     SymbolContent,
     ContentOnly,
@@ -329,16 +506,16 @@ pub(crate) enum BookmarkResolution {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedBookmarkLocation {
-    pub(crate) row: u32,
-    pub(crate) resolution: BookmarkResolution,
+struct ResolvedSourceLocation {
+    row: u32,
+    resolution: SourceLocationResolution,
 }
 
-pub(crate) fn resolve_syntactic_location(
+fn resolve_syntactic_location(
     snapshot: &language::BufferSnapshot,
     index: &SyntacticLocationIndex,
     location: &SyntacticLocation,
-) -> Option<ResolvedBookmarkLocation> {
+) -> Option<ResolvedSourceLocation> {
     if let Some(symbol) = location.symbol.as_ref()
         && let Some(resolved) = resolve_exact_symbol(
             snapshot,
@@ -357,22 +534,19 @@ pub(crate) fn resolve_syntactic_location(
         &location.content_marker,
         location.last_known_row,
     ) {
-        return Some(ResolvedBookmarkLocation {
+        return Some(ResolvedSourceLocation {
             row,
-            resolution: BookmarkResolution::ContentOnly,
+            resolution: SourceLocationResolution::ContentOnly,
         });
     }
 
     row_fallback(snapshot, location.last_known_row)
 }
 
-pub(crate) fn row_fallback(
-    snapshot: &BufferSnapshot,
-    row: u32,
-) -> Option<ResolvedBookmarkLocation> {
-    (row <= snapshot.max_point().row).then_some(ResolvedBookmarkLocation {
+fn row_fallback(snapshot: &BufferSnapshot, row: u32) -> Option<ResolvedSourceLocation> {
+    (row <= snapshot.max_point().row).then_some(ResolvedSourceLocation {
         row,
-        resolution: BookmarkResolution::RowFallback,
+        resolution: SourceLocationResolution::RowFallback,
     })
 }
 
@@ -382,7 +556,7 @@ fn resolve_exact_symbol(
     symbol: &SymbolRef,
     content_marker: &ContentMarker,
     last_known_row: u32,
-) -> Option<ResolvedBookmarkLocation> {
+) -> Option<ResolvedSourceLocation> {
     let matching_symbols = index
         .symbols
         .iter()
@@ -427,20 +601,20 @@ fn resolve_exact_symbol(
 
     let preferred_symbol = preferred_symbol?;
 
-    // Reaching this point with a non-empty content marker means the bookmarked
+    // Reaching this point with a non-empty content marker means the source
     // line is no longer inside any symbol with the stored path, so before
     // guessing a row positionally, check whether the exact line (confirmed by
     // context hash) moved elsewhere in the file, e.g. into another symbol.
     if let Some(row) = resolve_content_only(snapshot, index, content_marker, last_known_row) {
-        return Some(ResolvedBookmarkLocation {
+        return Some(ResolvedSourceLocation {
             row,
-            resolution: BookmarkResolution::ContentOnly,
+            resolution: SourceLocationResolution::ContentOnly,
         });
     }
 
-    Some(ResolvedBookmarkLocation {
+    Some(ResolvedSourceLocation {
         row: expected_row_in_range(&preferred_symbol.range, symbol.line_offset_in_symbol),
-        resolution: BookmarkResolution::ExactSymbol,
+        resolution: SourceLocationResolution::ExactSymbol,
     })
 }
 
@@ -457,7 +631,7 @@ struct SymbolCandidate {
 /// Picks the line match whose surrounding context hash still matches,
 /// preferring the symbol occurrence with the stored ordinal, then the row
 /// closest to the symbol-relative offset.
-fn closest_context_match(candidates: &[SymbolCandidate]) -> Option<ResolvedBookmarkLocation> {
+fn closest_context_match(candidates: &[SymbolCandidate]) -> Option<ResolvedSourceLocation> {
     struct RankedMatch {
         row: u32,
         is_preferred: bool,
@@ -478,12 +652,12 @@ fn closest_context_match(candidates: &[SymbolCandidate]) -> Option<ResolvedBookm
                 })
         })
         .min_by_key(|ranked| (!ranked.is_preferred, ranked.distance_from_expected))
-        .map(|ranked| ResolvedBookmarkLocation {
+        .map(|ranked| ResolvedSourceLocation {
             row: ranked.row,
             resolution: if ranked.is_preferred && ranked.distance_from_expected == 0 {
-                BookmarkResolution::ExactSymbol
+                SourceLocationResolution::ExactSymbol
             } else {
-                BookmarkResolution::SymbolContent
+                SourceLocationResolution::SymbolContent
             },
         })
 }
@@ -493,18 +667,18 @@ fn closest_context_match(candidates: &[SymbolCandidate]) -> Option<ResolvedBookm
 /// hash matched.
 fn closest_line_match_in_preferred_symbol(
     candidates: &[SymbolCandidate],
-) -> Option<ResolvedBookmarkLocation> {
+) -> Option<ResolvedSourceLocation> {
     let preferred = candidates.iter().find(|candidate| candidate.is_preferred)?;
     let content_match = preferred
         .line_matches
         .iter()
         .min_by_key(|content_match| content_match.row.abs_diff(preferred.expected_row))?;
-    Some(ResolvedBookmarkLocation {
+    Some(ResolvedSourceLocation {
         row: content_match.row,
         resolution: if content_match.row == preferred.expected_row {
-            BookmarkResolution::ExactSymbol
+            SourceLocationResolution::ExactSymbol
         } else {
-            BookmarkResolution::SymbolContent
+            SourceLocationResolution::SymbolContent
         },
     })
 }
@@ -620,7 +794,7 @@ mod tests {
                 },
                 Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             )
-            .with_outline_query(include_str!("../../../grammars/src/typescript/outline.scm"))
+            .with_outline_query(include_str!("../../grammars/src/typescript/outline.scm"))
             .expect("valid TypeScript outline query"),
         )
     }
@@ -644,7 +818,7 @@ mod tests {
         language: Option<Arc<Language>>,
         location: &SyntacticLocation,
         cx: &mut TestAppContext,
-    ) -> ResolvedBookmarkLocation {
+    ) -> ResolvedSourceLocation {
         let buffer = cx.new(|cx| {
             let buffer = Buffer::local(text, cx);
             if let Some(language) = language {
@@ -659,6 +833,54 @@ mod tests {
             resolve_syntactic_location(&snapshot, &index, location)
                 .expect("expected the bookmark location to resolve")
         })
+    }
+
+    #[gpui::test]
+    fn test_durable_source_location_preserves_pending_location_until_syntax_is_ready(
+        cx: &mut TestAppContext,
+    ) {
+        let serialized = SerializedSourceLocation {
+            row: 1,
+            syntactic_location: Some(SerializedSyntacticLocation {
+                symbol: Some(SerializedSymbolRef {
+                    symbol_path: vec!["fn target".to_string()],
+                    symbol_ordinal: 0,
+                    line_offset_in_symbol: 1,
+                }),
+                content_marker: SerializedContentMarker {
+                    line_text: "replacement();".to_string(),
+                    context_hash: 0,
+                },
+            }),
+        };
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                "fn unrelated() {}\n\nfn target() {\n    replacement();\n}\n",
+                cx,
+            )
+        });
+
+        let mut location = cx.update(|cx| {
+            let context = DurableSourceLocationContext::for_buffer(buffer.read(cx));
+            let mut location =
+                DurableSourceLocation::restore(serialized.clone(), &context).expect("location");
+            assert!(location.is_pending());
+            assert_eq!(location.serialize(&context), Some(serialized.clone()));
+            assert!(location.resolve_pending(&context));
+            assert!(location.is_pending());
+            location
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+
+        cx.update(|cx| {
+            let context = DurableSourceLocationContext::for_buffer(buffer.read(cx));
+            assert!(location.resolve_pending(&context));
+            assert_eq!(location.anchor().summary::<Point>(&context.snapshot).row, 3);
+            assert!(!location.is_pending());
+        });
     }
 
     #[gpui::test]
@@ -848,9 +1070,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 3,
-                resolution: BookmarkResolution::ExactSymbol,
+                resolution: SourceLocationResolution::ExactSymbol,
             }
         );
     }
@@ -873,9 +1095,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 3,
-                resolution: BookmarkResolution::SymbolContent,
+                resolution: SourceLocationResolution::SymbolContent,
             }
         );
     }
@@ -894,9 +1116,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 1,
-                resolution: BookmarkResolution::ContentOnly,
+                resolution: SourceLocationResolution::ContentOnly,
             }
         );
     }
@@ -919,9 +1141,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 9,
-                resolution: BookmarkResolution::SymbolContent,
+                resolution: SourceLocationResolution::SymbolContent,
             }
         );
     }
@@ -944,9 +1166,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 7,
-                resolution: BookmarkResolution::ContentOnly,
+                resolution: SourceLocationResolution::ContentOnly,
             }
         );
     }
@@ -969,9 +1191,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 2,
-                resolution: BookmarkResolution::ExactSymbol,
+                resolution: SourceLocationResolution::ExactSymbol,
             }
         );
     }
@@ -993,9 +1215,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 5,
-                resolution: BookmarkResolution::SymbolContent,
+                resolution: SourceLocationResolution::SymbolContent,
             }
         );
     }
@@ -1014,9 +1236,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 3,
-                resolution: BookmarkResolution::ContentOnly,
+                resolution: SourceLocationResolution::ContentOnly,
             }
         );
     }
@@ -1039,9 +1261,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 3,
-                resolution: BookmarkResolution::ContentOnly,
+                resolution: SourceLocationResolution::ContentOnly,
             }
         );
     }
@@ -1059,9 +1281,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 1,
-                resolution: BookmarkResolution::RowFallback,
+                resolution: SourceLocationResolution::RowFallback,
             }
         );
     }
@@ -1080,7 +1302,7 @@ mod tests {
         );
 
         assert_eq!(resolved.row, 1);
-        assert_ne!(resolved.resolution, BookmarkResolution::RowFallback);
+        assert_ne!(resolved.resolution, SourceLocationResolution::RowFallback);
     }
 
     #[gpui::test]
@@ -1097,9 +1319,9 @@ mod tests {
 
         assert_eq!(
             resolved,
-            ResolvedBookmarkLocation {
+            ResolvedSourceLocation {
                 row: 1,
-                resolution: BookmarkResolution::RowFallback,
+                resolution: SourceLocationResolution::RowFallback,
             }
         );
     }

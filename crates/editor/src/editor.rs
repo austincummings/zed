@@ -4091,7 +4091,7 @@ impl Editor {
             });
             for bookmark in bookmarks {
                 let Some(multi_buffer_anchor) =
-                    multi_buffer_snapshot.anchor_in_buffer(bookmark.anchor)
+                    multi_buffer_snapshot.anchor_in_buffer(bookmark.anchor())
                 else {
                     continue;
                 };
@@ -6138,13 +6138,13 @@ impl Editor {
                     .first()
                     .and_then(|bookmark| {
                         let bookmark_row = buffer_snapshot
-                            .summary_for_anchor::<text::PointUtf16>(&bookmark.anchor)
+                            .summary_for_anchor::<text::PointUtf16>(&bookmark.anchor())
                             .row;
 
                         if bookmark_row == row {
                             snapshot
                                 .buffer_snapshot()
-                                .anchor_in_excerpt(bookmark.anchor)
+                                .anchor_in_excerpt(bookmark.anchor())
                         } else {
                             None
                         }

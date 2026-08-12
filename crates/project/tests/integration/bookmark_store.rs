@@ -5,9 +5,9 @@ use gpui::{Entity, TestAppContext};
 use language::{Buffer, rust_lang};
 use project::{
     Project,
-    bookmark_store::{
-        SerializedBookmark, SerializedContentMarker, SerializedSymbolRef,
-        SerializedSyntacticLocation,
+    bookmark_store::SerializedBookmark,
+    durable_source_location::{
+        SerializedContentMarker, SerializedSymbolRef, SerializedSyntacticLocation,
     },
 };
 use serde_json::json;
