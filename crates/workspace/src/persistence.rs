@@ -22,9 +22,11 @@ use db::{
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::{
     ProjectGroupKey,
-    bookmark_store::{SYNTACTIC_LOCATION_VERSION, SerializedBookmark, SerializedSyntacticLocation},
+    bookmark_store::{
+        SYNTACTIC_LOCATION_FORMAT_VERSION, SerializedBookmark, SerializedSyntacticLocation,
+    },
     debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
-    durable_source_location::SerializedSourceLocation,
+    durable_source_location::DurableSourceLocation,
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
 
@@ -394,7 +396,7 @@ pub async fn write_default_dock_state(
 
 #[derive(Debug)]
 pub struct Bookmark {
-    pub source_location: SerializedSourceLocation,
+    pub source_location: DurableSourceLocation,
     pub label: String,
 }
 
@@ -426,13 +428,13 @@ impl sqlez::bindable::Bind for Bookmark {
             .as_ref()
             .map(|location| {
                 serde_json::to_string(&StoredSyntacticLocation {
-                    version: SYNTACTIC_LOCATION_VERSION,
+                    version: SYNTACTIC_LOCATION_FORMAT_VERSION,
                     location: location.clone(),
                 })
             })
             .transpose()?;
 
-        let next_index = statement.bind(&self.source_location.row, start_index)?;
+        let next_index = statement.bind(&self.source_location.fallback_row, start_index)?;
         let next_index = statement.bind(&self.label, next_index)?;
         statement.bind(&syntactic_location_json, next_index)
     }
@@ -455,8 +457,8 @@ impl Column for Bookmark {
 
         Ok((
             Bookmark {
-                source_location: SerializedSourceLocation {
-                    row,
+                source_location: DurableSourceLocation {
+                    fallback_row: row,
                     syntactic_location,
                 },
                 label,
@@ -476,7 +478,7 @@ fn validated_syntactic_location(json: &str) -> Result<SerializedSyntacticLocatio
     let stored: StoredSyntacticLocation =
         serde_json::from_str(json).context("parsing syntactic location")?;
     anyhow::ensure!(
-        stored.version == SYNTACTIC_LOCATION_VERSION,
+        stored.version == SYNTACTIC_LOCATION_FORMAT_VERSION,
         "unsupported syntactic location version {}",
         stored.version
     );
@@ -3193,7 +3195,7 @@ mod tests {
 
     #[test]
     fn test_invalid_syntactic_locations_fall_back_to_row() {
-        let unsupported_version = SYNTACTIC_LOCATION_VERSION + 1;
+        let unsupported_version = SYNTACTIC_LOCATION_FORMAT_VERSION + 1;
         assert_eq!(
             deserialize_syntactic_location(&format!(
                 r#"{{"version":{unsupported_version},"symbol":null,"content_marker":{{"line_text":"line","context_hash":1}}}}"#
@@ -3203,13 +3205,13 @@ mod tests {
         assert_eq!(deserialize_syntactic_location("{"), None);
         assert_eq!(
             deserialize_syntactic_location(&format!(
-                r#"{{"version":{SYNTACTIC_LOCATION_VERSION},"symbol":null}}"#
+                r#"{{"version":{SYNTACTIC_LOCATION_FORMAT_VERSION},"symbol":null}}"#
             )),
             None
         );
         assert_eq!(
             deserialize_syntactic_location(&format!(
-                r#"{{"version":{SYNTACTIC_LOCATION_VERSION},"symbol":{{"symbol_path":[],"symbol_ordinal":0,"line_offset_in_symbol":0}},"content_marker":{{"line_text":"line","context_hash":1}}}}"#
+                r#"{{"version":{SYNTACTIC_LOCATION_FORMAT_VERSION},"symbol":{{"symbol_path":[],"symbol_ordinal":0,"line_offset_in_symbol":0}},"content_marker":{{"line_text":"line","context_hash":1}}}}"#
             )),
             None
         );

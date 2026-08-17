@@ -9,7 +9,7 @@ use project::{
         SerializedBookmark, SerializedContentMarker, SerializedSymbolRef,
         SerializedSyntacticLocation,
     },
-    durable_source_location::SerializedSourceLocation,
+    durable_source_location::DurableSourceLocation,
 };
 use serde_json::json;
 use util::path;
@@ -40,8 +40,8 @@ mod integration {
 
     #[test]
     fn test_serialized_bookmark_source_location_round_trip() {
-        let source_location = SerializedSourceLocation {
-            row: 7,
+        let source_location = DurableSourceLocation {
+            fallback_row: 7,
             syntactic_location: Some(SerializedSyntacticLocation {
                 symbol: Some(SerializedSymbolRef {
                     symbol_path: vec!["class Store".to_string(), "method()".to_string()],
