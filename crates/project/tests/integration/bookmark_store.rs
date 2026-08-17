@@ -116,11 +116,10 @@ mod integration {
         project: &Entity<Project>,
         cx: &mut TestAppContext,
     ) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
-        project.read_with(cx, |project, cx| {
-            project
-                .bookmark_store()
-                .read(cx)
-                .all_serialized_bookmarks(cx)
+        project.update(cx, |project, cx| {
+            project.bookmark_store().update(cx, |bookmark_store, cx| {
+                bookmark_store.all_serialized_bookmarks(cx)
+            })
         })
     }
 
@@ -660,7 +659,9 @@ mod integration {
     }
 
     #[gpui::test]
-    async fn test_symbol_data_recovers_after_language_parse(cx: &mut TestAppContext) {
+    async fn test_new_bookmark_serialized_while_parsing_recovers_symbol_data(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         cx.executor().allow_parking();
 
@@ -673,15 +674,20 @@ mod integration {
 
         let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
         let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_sync_parse_timeout(None);
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        assert!(buffer.read_with(cx, |buffer, _| buffer.is_parsing()));
         add_bookmarks(&project, &buffer, &[1], cx);
 
-        let before_parse = get_all_bookmarks(&project, cx);
-        let before_parse_location = before_parse
+        let while_parsing = get_all_bookmarks(&project, cx);
+        let while_parsing_location = while_parsing
             .get(&project_path(path!("/project/file.rs")))
             .and_then(|bookmarks| bookmarks.first())
             .and_then(|bookmark| bookmark.syntactic_location.as_ref())
-            .expect("bookmark should serialize before parsing");
-        assert_eq!(before_parse_location.symbol, None);
+            .expect("bookmark should serialize while parsing");
+        assert_eq!(while_parsing_location.symbol, None);
 
         let notified = Rc::new(Cell::new(false));
         let _observation = cx.update(|cx| {
@@ -692,11 +698,6 @@ mod integration {
             })
         });
 
-        buffer.update(cx, |buffer, cx| {
-            buffer.set_sync_parse_timeout(None);
-            buffer.set_language(Some(rust_lang()), cx);
-        });
-        assert!(buffer.read_with(cx, |buffer, _| buffer.is_parsing()));
         assert!(
             !notified.get(),
             "bookmark store should wait for parsing to complete"
@@ -720,6 +721,80 @@ mod integration {
                 .expect("symbol data should be recomputed after parsing")
                 .symbol_path,
             vec!["fn bookmarked".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_complete_symbol_data_is_preserved_while_parsing(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file.rs": "fn bookmarked() {\n    target();\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        add_bookmarks(&project, &buffer, &[1], cx);
+
+        let complete = get_all_bookmarks(&project, cx);
+        let complete_location = complete
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.clone())
+            .expect("bookmark should initially serialize with symbol data");
+        assert!(complete_location.symbol.is_some());
+
+        let notified = Rc::new(Cell::new(false));
+        let _observation = cx.update(|cx| {
+            let bookmark_store = project.read(cx).bookmark_store();
+            cx.observe(&bookmark_store, {
+                let notified = notified.clone();
+                move |_, _| notified.set(true)
+            })
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_sync_parse_timeout(None);
+            buffer.edit([(0..0, "// inserted\n")], None, cx);
+        });
+        assert!(buffer.read_with(cx, |buffer, _| buffer.is_parsing()));
+
+        let while_parsing = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&while_parsing, path!("/project/file.rs"), &[2]);
+        let while_parsing_location = while_parsing
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should preserve its complete syntactic location");
+        assert_eq!(while_parsing_location, &complete_location);
+        assert!(
+            !notified.get(),
+            "serializing provisional metadata should wait for parsing to complete"
+        );
+
+        cx.run_until_parked();
+
+        assert!(
+            notified.get(),
+            "bookmark store should notify after provisional metadata can be completed"
+        );
+        let after_parse = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&after_parse, path!("/project/file.rs"), &[2]);
+        assert!(
+            after_parse
+                .get(&project_path(path!("/project/file.rs")))
+                .and_then(|bookmarks| bookmarks.first())
+                .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+                .and_then(|location| location.symbol.as_ref())
+                .is_some(),
+            "bookmark should serialize complete symbol data after parsing"
         );
     }
 

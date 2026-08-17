@@ -32308,20 +32308,19 @@ impl BookmarkTestContext {
         })
     }
 
-    fn all_bookmarks(&self) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
-        self.project.read_with(&self.cx, |project, cx| {
-            project
-                .bookmark_store()
-                .read(cx)
-                .all_serialized_bookmarks(cx)
+    fn all_bookmarks(&mut self) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
+        self.project.update(&mut self.cx, |project, cx| {
+            project.bookmark_store().update(cx, |bookmark_store, cx| {
+                bookmark_store.all_serialized_bookmarks(cx)
+            })
         })
     }
 
-    fn assert_bookmarked_file_count(&self, expected_count: usize) {
+    fn assert_bookmarked_file_count(&mut self, expected_count: usize) {
         assert_eq!(expected_count, self.all_bookmarks().len());
     }
 
-    fn assert_bookmark_rows(&self, expected_rows: Vec<u32>) {
+    fn assert_bookmark_rows(&mut self, expected_rows: Vec<u32>) {
         let abs_path = self.abs_path();
         let bookmarks = self.all_bookmarks();
         if expected_rows.is_empty() {
@@ -32342,7 +32341,7 @@ impl BookmarkTestContext {
         }
     }
 
-    fn assert_bookmark_labels(&self, expected_labels: Vec<(u32, &str)>) {
+    fn assert_bookmark_labels(&mut self, expected_labels: Vec<(u32, &str)>) {
         let abs_path = self.abs_path();
         let bookmarks = self.all_bookmarks();
         let mut labels: Vec<(u32, &str)> = bookmarks
