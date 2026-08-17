@@ -27,6 +27,7 @@ mod integration {
         SerializedBookmark {
             row,
             label: String::new(),
+            syntactic_location: None,
         }
     }
 

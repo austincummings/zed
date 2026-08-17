@@ -8,6 +8,12 @@ use language::{Buffer, BufferEvent};
 use std::collections::HashMap;
 use text::{BufferSnapshot, Point};
 
+use crate::durable_source_location::SerializedSourceLocation;
+pub use crate::durable_source_location::{
+    SYNTACTIC_LOCATION_VERSION, SerializedContentMarker, SerializedSymbolRef,
+    SerializedSyntacticLocation,
+};
+
 use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
 
 #[derive(Clone, Debug)]
@@ -20,6 +26,24 @@ pub struct Bookmark {
 pub struct SerializedBookmark {
     pub row: u32,
     pub label: String,
+    pub syntactic_location: Option<SerializedSyntacticLocation>,
+}
+
+impl SerializedBookmark {
+    pub fn source_location(&self) -> SerializedSourceLocation {
+        SerializedSourceLocation {
+            row: self.row,
+            syntactic_location: self.syntactic_location.clone(),
+        }
+    }
+
+    pub fn from_source_location(source_location: SerializedSourceLocation, label: String) -> Self {
+        Self {
+            row: source_location.row,
+            label,
+            syntactic_location: source_location.syntactic_location,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -383,6 +407,7 @@ impl BookmarkStore {
                                 Some(SerializedBookmark {
                                     row,
                                     label: bookmark.label.clone(),
+                                    syntactic_location: None,
                                 })
                             })
                             .collect()

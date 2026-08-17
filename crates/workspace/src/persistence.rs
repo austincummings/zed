@@ -22,8 +22,9 @@ use db::{
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::{
     ProjectGroupKey,
-    bookmark_store::SerializedBookmark,
+    bookmark_store::{SYNTACTIC_LOCATION_VERSION, SerializedBookmark, SerializedSyntacticLocation},
     debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
+    durable_source_location::SerializedSourceLocation,
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
 
@@ -393,14 +394,23 @@ pub async fn write_default_dock_state(
 
 #[derive(Debug)]
 pub struct Bookmark {
-    pub row: u32,
+    pub source_location: SerializedSourceLocation,
     pub label: String,
+}
+
+/// On-disk representation of a bookmark's syntactic location: the location
+/// fields plus a format version, stored as a single JSON column.
+#[derive(Serialize, Deserialize)]
+struct StoredSyntacticLocation {
+    version: u32,
+    #[serde(flatten)]
+    location: SerializedSyntacticLocation,
 }
 
 impl sqlez::bindable::StaticColumnCount for Bookmark {
     fn column_count() -> usize {
-        // row, label
-        2
+        // row, label, syntactic_location
+        3
     }
 }
 
@@ -410,8 +420,21 @@ impl sqlez::bindable::Bind for Bookmark {
         statement: &sqlez::statement::Statement,
         start_index: i32,
     ) -> anyhow::Result<i32> {
-        let next_index = statement.bind(&self.row, start_index)?;
-        statement.bind(&self.label, next_index)
+        let syntactic_location_json = self
+            .source_location
+            .syntactic_location
+            .as_ref()
+            .map(|location| {
+                serde_json::to_string(&StoredSyntacticLocation {
+                    version: SYNTACTIC_LOCATION_VERSION,
+                    location: location.clone(),
+                })
+            })
+            .transpose()?;
+
+        let next_index = statement.bind(&self.source_location.row, start_index)?;
+        let next_index = statement.bind(&self.label, next_index)?;
+        statement.bind(&syntactic_location_json, next_index)
     }
 }
 
@@ -423,9 +446,42 @@ impl Column for Bookmark {
             as u32;
 
         let (label, next_index) = String::column(statement, start_index + 1)?;
+        let (syntactic_location_json, next_index) =
+            Option::<String>::column(statement, next_index)?;
 
-        Ok((Bookmark { row, label }, next_index))
+        let syntactic_location = syntactic_location_json
+            .as_deref()
+            .and_then(deserialize_syntactic_location);
+
+        Ok((
+            Bookmark {
+                source_location: SerializedSourceLocation {
+                    row,
+                    syntactic_location,
+                },
+                label,
+            },
+            next_index,
+        ))
     }
+}
+
+fn deserialize_syntactic_location(json: &str) -> Option<SerializedSyntacticLocation> {
+    validated_syntactic_location(json)
+        .inspect_err(|error| log::warn!("Ignoring invalid syntactic bookmark location: {error:#}"))
+        .ok()
+}
+
+fn validated_syntactic_location(json: &str) -> Result<SerializedSyntacticLocation> {
+    let stored: StoredSyntacticLocation =
+        serde_json::from_str(json).context("parsing syntactic location")?;
+    anyhow::ensure!(
+        stored.version == SYNTACTIC_LOCATION_VERSION,
+        "unsupported syntactic location version {}",
+        stored.version
+    );
+    stored.location.validate()?;
+    Ok(stored.location)
 }
 
 #[derive(Debug)]
@@ -1051,6 +1107,9 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE bookmarks ADD COLUMN label TEXT NOT NULL DEFAULT "";
         ),
+        sql!(
+            ALTER TABLE bookmarks ADD COLUMN syntactic_location TEXT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1312,7 +1371,7 @@ impl WorkspaceDb {
     fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
         let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
             .select_bound(sql! {
-                SELECT path, row, label
+                SELECT path, row, label, syntactic_location
                 FROM bookmarks
                 WHERE workspace_id = ?
                 ORDER BY path, row
@@ -1329,12 +1388,12 @@ impl WorkspaceDb {
 
                 for (path, bookmark) in bookmarks {
                     let path: Arc<Path> = path.into();
-                    map.entry(path.clone())
-                        .or_default()
-                        .push(SerializedBookmark {
-                            row: bookmark.row,
-                            label: bookmark.label,
-                        })
+                    map.entry(path.clone()).or_default().push(
+                        SerializedBookmark::from_source_location(
+                            bookmark.source_location,
+                            bookmark.label,
+                        ),
+                    )
                 }
 
                 map
@@ -1496,9 +1555,23 @@ impl WorkspaceDb {
                 for (path, bookmarks) in workspace.bookmarks {
                     for bookmark in bookmarks {
                         conn.exec_bound(sql!(
-                            INSERT INTO bookmarks (workspace_id, path, row, label)
-                            VALUES (?1, ?2, ?3, ?4);
-                        ))?((workspace.id, path.as_ref(), bookmark.row, bookmark.label)).context("Inserting bookmark")?;
+                            INSERT INTO bookmarks (
+                                workspace_id,
+                                path,
+                                row,
+                                label,
+                                syntactic_location
+                            )
+                            VALUES (?1, ?2, ?3, ?4, ?5);
+                        ))?((
+                            workspace.id,
+                            path.as_ref(),
+                            Bookmark {
+                                source_location: bookmark.source_location(),
+                                label: bookmark.label,
+                            },
+                        ))
+                        .context("Inserting bookmark")?;
                     }
                 }
 
@@ -2778,6 +2851,7 @@ mod tests {
         },
     };
     use gpui::TaskExt;
+    use project::bookmark_store::{SerializedContentMarker, SerializedSymbolRef};
 
     use gpui::AppContext as _;
     use pretty_assertions::assert_eq;
@@ -3046,6 +3120,99 @@ mod tests {
         );
         assert_eq!(loaded_breakpoints[4].state, hit_condition_breakpoint.state);
         assert_eq!(loaded_breakpoints[4].path, Arc::from(path));
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_with_syntactic_locations() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_bookmarks_with_syntactic_locations").await;
+        let id = db.next_id().await.unwrap();
+        let path = Arc::<Path>::from(Path::new("/tmp/bookmarks.ts"));
+        let expected_bookmarks = BTreeMap::from([(
+            path,
+            vec![
+                SerializedBookmark {
+                    row: 5,
+                    label: "method".to_string(),
+                    syntactic_location: Some(SerializedSyntacticLocation {
+                        symbol: Some(SerializedSymbolRef {
+                            symbol_path: vec![
+                                "class Store".to_string(),
+                                "bookmarked()".to_string(),
+                            ],
+                            symbol_ordinal: 2,
+                            line_offset_in_symbol: 3,
+                        }),
+                        content_marker: SerializedContentMarker {
+                            line_text: "return value;".to_string(),
+                            context_hash: 0xabab,
+                        },
+                    }),
+                },
+                SerializedBookmark {
+                    row: 9,
+                    label: "legacy".to_string(),
+                    syntactic_location: None,
+                },
+                SerializedBookmark {
+                    row: 12,
+                    label: "plaintext".to_string(),
+                    syntactic_location: Some(SerializedSyntacticLocation {
+                        symbol: None,
+                        content_marker: SerializedContentMarker {
+                            line_text: "bookmarked text".to_string(),
+                            context_hash: 0xcdcd,
+                        },
+                    }),
+                },
+            ],
+        )]);
+        let workspace = SerializedWorkspace {
+            id,
+            paths: PathList::new(&["/tmp"]),
+            identity_paths: None,
+            location: SerializedWorkspaceLocation::Local,
+            center_group: Default::default(),
+            window_bounds: Default::default(),
+            display: Default::default(),
+            docks: Default::default(),
+            centered_layout: false,
+            bookmarks: expected_bookmarks.clone(),
+            breakpoints: Default::default(),
+            session_id: None,
+            window_id: None,
+            user_toolchains: Default::default(),
+        };
+
+        db.save_workspace(workspace).await;
+
+        let loaded = db.workspace_for_roots(&["/tmp"]).unwrap();
+        assert_eq!(loaded.bookmarks, expected_bookmarks);
+    }
+
+    #[test]
+    fn test_invalid_syntactic_locations_fall_back_to_row() {
+        let unsupported_version = SYNTACTIC_LOCATION_VERSION + 1;
+        assert_eq!(
+            deserialize_syntactic_location(&format!(
+                r#"{{"version":{unsupported_version},"symbol":null,"content_marker":{{"line_text":"line","context_hash":1}}}}"#
+            )),
+            None
+        );
+        assert_eq!(deserialize_syntactic_location("{"), None);
+        assert_eq!(
+            deserialize_syntactic_location(&format!(
+                r#"{{"version":{SYNTACTIC_LOCATION_VERSION},"symbol":null}}"#
+            )),
+            None
+        );
+        assert_eq!(
+            deserialize_syntactic_location(&format!(
+                r#"{{"version":{SYNTACTIC_LOCATION_VERSION},"symbol":{{"symbol_path":[],"symbol_ordinal":0,"line_offset_in_symbol":0}},"content_marker":{{"line_text":"line","context_hash":1}}}}"#
+            )),
+            None
+        );
     }
 
     #[gpui::test]
