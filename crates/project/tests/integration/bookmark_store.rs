@@ -1,9 +1,16 @@
-use std::{path::Path, sync::Arc};
+use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
 
 use collections::BTreeMap;
 use gpui::{Entity, TestAppContext};
-use language::Buffer;
-use project::{Project, bookmark_store::SerializedBookmark};
+use language::{Buffer, rust_lang};
+use project::{
+    Project,
+    bookmark_store::{
+        SerializedBookmark, SerializedContentMarker, SerializedSymbolRef,
+        SerializedSyntacticLocation,
+    },
+    durable_source_location::SerializedSourceLocation,
+};
 use serde_json::json;
 use util::path;
 
@@ -29,6 +36,30 @@ mod integration {
             label: String::new(),
             syntactic_location: None,
         }
+    }
+
+    #[test]
+    fn test_serialized_bookmark_source_location_round_trip() {
+        let source_location = SerializedSourceLocation {
+            row: 7,
+            syntactic_location: Some(SerializedSyntacticLocation {
+                symbol: Some(SerializedSymbolRef {
+                    symbol_path: vec!["class Store".to_string(), "method()".to_string()],
+                    symbol_ordinal: 1,
+                    line_offset_in_symbol: 2,
+                }),
+                content_marker: SerializedContentMarker {
+                    line_text: "target();".to_string(),
+                    context_hash: 42,
+                },
+            }),
+        };
+
+        let bookmark =
+            SerializedBookmark::from_source_location(source_location.clone(), "label".to_string());
+
+        assert_eq!(bookmark.source_location(), source_location);
+        assert_eq!(bookmark.label, "label");
     }
 
     async fn open_buffer(
@@ -91,6 +122,25 @@ mod integration {
                 .read(cx)
                 .all_serialized_bookmarks(cx)
         })
+    }
+
+    fn resolve_bookmarks_for_buffer(
+        project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        cx: &mut TestAppContext,
+    ) {
+        project.update(cx, |project, cx| {
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            project.bookmark_store().update(cx, |store, cx| {
+                store.bookmarks_for_buffer(
+                    buffer.clone(),
+                    buffer_snapshot.anchor_before(0)
+                        ..buffer_snapshot.anchor_after(buffer_snapshot.len()),
+                    &buffer_snapshot,
+                    cx,
+                );
+            });
+        });
     }
 
     fn build_serialized(
@@ -192,6 +242,12 @@ mod integration {
         let bookmarks = get_all_bookmarks(&project, cx);
         assert_eq!(bookmarks.len(), 1);
         assert_bookmark_rows(&bookmarks, path!("/project/file1.rs"), &[0, 2]);
+        assert!(
+            bookmarks
+                .values()
+                .flatten()
+                .all(|bookmark| bookmark.syntactic_location.is_some())
+        );
     }
 
     #[gpui::test]
@@ -399,6 +455,410 @@ mod integration {
     }
 
     #[gpui::test]
+    async fn test_unloaded_syntactic_locations_are_preserved(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file1.rs": "fn bookmarked() {\n    return;\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let serialized = BTreeMap::from([(
+            project_path(path!("/project/file1.rs")),
+            vec![SerializedBookmark {
+                row: 1,
+                label: "inside function".to_string(),
+                syntactic_location: Some(SerializedSyntacticLocation {
+                    symbol: Some(SerializedSymbolRef {
+                        symbol_path: vec!["fn bookmarked".to_string()],
+                        symbol_ordinal: 0,
+                        line_offset_in_symbol: 1,
+                    }),
+                    content_marker: SerializedContentMarker {
+                        line_text: "return;".to_string(),
+                        context_hash: 42,
+                    },
+                }),
+            }],
+        )]);
+
+        restore_bookmarks(&project, serialized.clone(), cx).await;
+
+        assert_eq!(get_all_bookmarks(&project, cx), serialized);
+    }
+
+    #[gpui::test]
+    async fn test_restored_syntactic_location_waits_for_language_parse(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file.rs": "fn unrelated() {}\n\nfn bookmarked() {\n    replacement();\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let serialized = BTreeMap::from([(
+            project_path(path!("/project/file.rs")),
+            vec![SerializedBookmark {
+                row: 1,
+                label: String::new(),
+                syntactic_location: Some(SerializedSyntacticLocation {
+                    symbol: Some(SerializedSymbolRef {
+                        symbol_path: vec!["fn bookmarked".to_string()],
+                        symbol_ordinal: 0,
+                        line_offset_in_symbol: 1,
+                    }),
+                    content_marker: SerializedContentMarker {
+                        line_text: "target();".to_string(),
+                        context_hash: 42,
+                    },
+                }),
+            }],
+        )]);
+        restore_bookmarks(&project, serialized, cx).await;
+
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        resolve_bookmarks_for_buffer(&project, &buffer, cx);
+        let pending = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&pending, path!("/project/file.rs"), &[1]);
+        let pending_location = pending
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should retain its serialized location while parsing is unavailable");
+        assert_eq!(
+            pending_location
+                .symbol
+                .as_ref()
+                .expect("symbol data should be retained")
+                .symbol_path,
+            vec!["fn bookmarked".to_string()]
+        );
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(0..0, "// inserted while syntax is unavailable\n")],
+                None,
+                cx,
+            );
+        });
+        let moved_while_pending = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&moved_while_pending, path!("/project/file.rs"), &[2]);
+        let moved_location = moved_while_pending
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("pending bookmark should retain its serialized location after edits");
+        assert_eq!(
+            moved_location
+                .symbol
+                .as_ref()
+                .expect("symbol data should be retained")
+                .symbol_path,
+            vec!["fn bookmarked".to_string()]
+        );
+
+        let notified = Rc::new(Cell::new(false));
+        let _observation = cx.update(|cx| {
+            let bookmark_store = project.read(cx).bookmark_store();
+            cx.observe(&bookmark_store, {
+                let notified = notified.clone();
+                move |_, _| notified.set(true)
+            })
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_sync_parse_timeout(None);
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        assert!(buffer.read_with(cx, |buffer, _| buffer.is_parsing()));
+        assert!(
+            !notified.get(),
+            "bookmark store should wait for parsing to complete"
+        );
+        cx.run_until_parked();
+
+        assert!(
+            notified.get(),
+            "bookmark store should notify after the buffer is reparsed"
+        );
+        let healed = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&healed, path!("/project/file.rs"), &[4]);
+        let healed_location = healed
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should serialize with a language");
+        assert_eq!(
+            healed_location
+                .symbol
+                .as_ref()
+                .expect("symbol data should be recomputed once the outline exists")
+                .symbol_path,
+            vec!["fn bookmarked".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unresolvable_pending_source_location_retains_provisional_bookmark(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"file.rs": "fn unrelated() {}\n"}))
+            .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let serialized = BTreeMap::from([(
+            project_path(path!("/project/file.rs")),
+            vec![SerializedBookmark {
+                row: 100,
+                label: String::new(),
+                syntactic_location: Some(SerializedSyntacticLocation {
+                    symbol: Some(SerializedSymbolRef {
+                        symbol_path: vec!["fn missing".to_string()],
+                        symbol_ordinal: 0,
+                        line_offset_in_symbol: 1,
+                    }),
+                    content_marker: SerializedContentMarker {
+                        line_text: "missing();".to_string(),
+                        context_hash: 42,
+                    },
+                }),
+            }],
+        )]);
+        restore_bookmarks(&project, serialized, cx).await;
+
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        resolve_bookmarks_for_buffer(&project, &buffer, cx);
+        assert_bookmark_rows(
+            &get_all_bookmarks(&project, cx),
+            path!("/project/file.rs"),
+            &[1],
+        );
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_sync_parse_timeout(None);
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        cx.run_until_parked();
+
+        assert_bookmark_rows(
+            &get_all_bookmarks(&project, cx),
+            path!("/project/file.rs"),
+            &[1],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_symbol_data_recovers_after_language_parse(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file.rs": "fn bookmarked() {\n    target();\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        add_bookmarks(&project, &buffer, &[1], cx);
+
+        let before_parse = get_all_bookmarks(&project, cx);
+        let before_parse_location = before_parse
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should serialize before parsing");
+        assert_eq!(before_parse_location.symbol, None);
+
+        let notified = Rc::new(Cell::new(false));
+        let _observation = cx.update(|cx| {
+            let bookmark_store = project.read(cx).bookmark_store();
+            cx.observe(&bookmark_store, {
+                let notified = notified.clone();
+                move |_, _| notified.set(true)
+            })
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_sync_parse_timeout(None);
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        assert!(buffer.read_with(cx, |buffer, _| buffer.is_parsing()));
+        assert!(
+            !notified.get(),
+            "bookmark store should wait for parsing to complete"
+        );
+        cx.run_until_parked();
+
+        assert!(
+            notified.get(),
+            "bookmark store should notify after the buffer is reparsed"
+        );
+        let after_parse = get_all_bookmarks(&project, cx);
+        let after_parse_location = after_parse
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .and_then(|bookmark| bookmark.syntactic_location.as_ref())
+            .expect("bookmark should serialize after parsing");
+        assert_eq!(
+            after_parse_location
+                .symbol
+                .as_ref()
+                .expect("symbol data should be recomputed after parsing")
+                .symbol_path,
+            vec!["fn bookmarked".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_syntactic_bookmark_resolves_after_edit_inside_symbol(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file.rs": "fn bookmarked() {\n    target();\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        add_bookmarks(&project, &buffer, &[1], cx);
+        let serialized = get_all_bookmarks(&project, cx);
+
+        clear_bookmarks(&project, cx);
+        buffer.update(cx, |buffer, cx| {
+            let insertion_offset = "fn bookmarked() {\n".len();
+            buffer.edit(
+                [(
+                    insertion_offset..insertion_offset,
+                    "    let inserted = true;\n",
+                )],
+                None,
+                cx,
+            );
+        });
+        restore_bookmarks(&project, serialized, cx).await;
+        resolve_bookmarks_for_buffer(&project, &buffer, cx);
+
+        let restored = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&restored, path!("/project/file.rs"), &[2]);
+        let bookmark = restored
+            .get(&project_path(path!("/project/file.rs")))
+            .and_then(|bookmarks| bookmarks.first())
+            .expect("resolved bookmark");
+        let location = bookmark
+            .syntactic_location
+            .as_ref()
+            .expect("resolved bookmark should retain syntactic metadata");
+        assert_eq!(location.content_marker.line_text, "target();");
+        assert_eq!(
+            location
+                .symbol
+                .as_ref()
+                .expect("resolved bookmark should remain bound to its symbol")
+                .line_offset_in_symbol,
+            2
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plaintext_bookmark_resolves_from_content_context(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"notes.txt": "prefix\nbefore\nbookmarked\nafter\nsuffix\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/notes.txt"), cx).await;
+        add_bookmarks(&project, &buffer, &[2], cx);
+        let serialized = get_all_bookmarks(&project, cx);
+
+        clear_bookmarks(&project, cx);
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "unrelated\n")], None, cx);
+        });
+        restore_bookmarks(&project, serialized, cx).await;
+        resolve_bookmarks_for_buffer(&project, &buffer, cx);
+
+        let restored = get_all_bookmarks(&project, cx);
+        assert_bookmark_rows(&restored, path!("/project/notes.txt"), &[3]);
+        let bookmark = restored
+            .get(&project_path(path!("/project/notes.txt")))
+            .and_then(|bookmarks| bookmarks.first())
+            .expect("resolved bookmark");
+        assert!(
+            bookmark
+                .syntactic_location
+                .as_ref()
+                .expect("resolved bookmark should retain location metadata")
+                .symbol
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_syntactic_bookmark_resolves_when_stored_row_is_out_of_range(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"file.rs": "fn bookmarked() {\n    target();\n}\n"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = open_buffer(&project, path!("/project/file.rs"), cx).await;
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(rust_lang()), cx);
+        });
+        add_bookmarks(&project, &buffer, &[1], cx);
+        let mut serialized = get_all_bookmarks(&project, cx);
+        serialized
+            .get_mut(&project_path(path!("/project/file.rs")))
+            .expect("serialized bookmark")
+            .first_mut()
+            .expect("serialized bookmark")
+            .row = 100;
+
+        clear_bookmarks(&project, cx);
+        restore_bookmarks(&project, serialized, cx).await;
+        resolve_bookmarks_for_buffer(&project, &buffer, cx);
+
+        assert_bookmark_rows(
+            &get_all_bookmarks(&project, cx),
+            path!("/project/file.rs"),
+            &[1],
+        );
+    }
+
+    #[gpui::test]
     async fn test_with_serialized_bookmarks_skips_out_of_range_rows(cx: &mut TestAppContext) {
         init_test(cx);
         cx.executor().allow_parking();
@@ -599,6 +1059,21 @@ mod integration {
 
         let serialized = get_all_bookmarks(&project, cx);
         assert_bookmark_rows(&serialized, path!("/project/file.rs"), &[2, 4]);
+        let content_lines = serialized
+            .get(&project_path(path!("/project/file.rs")))
+            .expect("bookmarks for edited file")
+            .iter()
+            .map(|bookmark| {
+                bookmark
+                    .syntactic_location
+                    .as_ref()
+                    .expect("syntactic location")
+                    .content_marker
+                    .line_text
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(content_lines, ["bbb", "ddd"]);
 
         // Clear and restore
         clear_bookmarks(&project, cx);

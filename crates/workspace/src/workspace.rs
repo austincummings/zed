@@ -1650,6 +1650,16 @@ impl Workspace {
             },
         )
         .detach();
+
+        cx.observe_in(
+            &project.read(cx).bookmark_store(),
+            window,
+            |workspace, _, window, cx| {
+                workspace.serialize_workspace(window, cx);
+            },
+        )
+        .detach();
+
         if let Some(toolchain_store) = project.read(cx).toolchain_store() {
             cx.subscribe_in(
                 &toolchain_store,

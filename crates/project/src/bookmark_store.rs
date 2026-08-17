@@ -1,17 +1,24 @@
-use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::FuturesUnordered};
 use gpui::{App, AppContext, Context, Entity, Subscription, Task};
 use itertools::Itertools;
-use language::{Buffer, BufferEvent};
-use std::collections::HashMap;
+use language::{Buffer, BufferEvent, PLAIN_TEXT, ParseStatus};
 use text::{BufferSnapshot, Point};
 
-use crate::durable_source_location::SerializedSourceLocation;
 pub use crate::durable_source_location::{
     SYNTACTIC_LOCATION_VERSION, SerializedContentMarker, SerializedSymbolRef,
     SerializedSyntacticLocation,
+};
+use crate::durable_source_location::{
+    SerializedSourceLocation, SourceLocationResolution, SourceLocationResolver,
+    SourceLocationSerialization,
 };
 
 use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
@@ -20,6 +27,7 @@ use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStor
 pub struct Bookmark {
     pub anchor: text::Anchor,
     pub label: String,
+    pending_source_location: Option<SerializedSourceLocation>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +58,7 @@ impl SerializedBookmark {
 pub struct BufferBookmarks {
     buffer: Entity<Buffer>,
     bookmarks: Vec<Bookmark>,
+    needs_reserialization_after_reparse: bool,
     _subscription: Subscription,
 }
 
@@ -61,6 +70,12 @@ impl BufferBookmarks {
                 BufferEvent::FileHandleChanged => {
                     bookmark_store.handle_file_changed(buffer, cx);
                 }
+                BufferEvent::LanguageChanged(_) => {
+                    bookmark_store.handle_language_changed(buffer, cx);
+                }
+                BufferEvent::Reparsed => {
+                    bookmark_store.handle_reparsed(buffer, cx);
+                }
                 _ => {}
             },
         );
@@ -68,6 +83,7 @@ impl BufferBookmarks {
         Self {
             buffer,
             bookmarks: Vec::new(),
+            needs_reserialization_after_reparse: false,
             _subscription: subscription,
         }
     }
@@ -150,28 +166,63 @@ impl BookmarkStore {
             return;
         };
 
+        let resolver = SourceLocationResolver::for_buffer(buffer.read(cx));
         let snapshot = buffer.read(cx).snapshot();
-        let max_point = snapshot.max_point();
 
         let bookmarks: Vec<Bookmark> = bookmarks
             .iter()
             .filter_map(|bookmark| {
-                let point = Point::new(bookmark.row, 0);
+                let source_location = bookmark.source_location();
+                let (row, pending_source_location) = match resolver.resolve(&source_location) {
+                    Ok(SourceLocationResolution::Resolved { row, kind }) => {
+                        if bookmark.syntactic_location.is_some() {
+                            log::debug!(
+                                "Resolved syntactic bookmark at {} from row {} to row {} using {:?}",
+                                abs_path.display(),
+                                bookmark.row,
+                                row,
+                                kind,
+                            );
+                        }
+                        (row, None)
+                    }
+                    Ok(SourceLocationResolution::Deferred { provisional_row }) => {
+                        (provisional_row, Some(source_location))
+                    }
+                    Ok(SourceLocationResolution::Unresolvable) => {
+                        log::warn!(
+                            "Skipping out-of-range bookmark: {} row {} (file has {} rows)",
+                            abs_path.display(),
+                            bookmark.row,
+                            snapshot.max_point().row
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Ignoring invalid syntactic location for bookmark at {} row {}: {error:#}",
+                            abs_path.display(),
+                            bookmark.row
+                        );
+                        let SourceLocationResolution::Resolved { row, .. } =
+                            resolver.resolve_row(bookmark.row)
+                        else {
+                            log::warn!(
+                                "Skipping out-of-range bookmark: {} row {} (file has {} rows)",
+                                abs_path.display(),
+                                bookmark.row,
+                                snapshot.max_point().row
+                            );
+                            return None;
+                        };
+                        (row, None)
+                    }
+                };
 
-                if point > max_point {
-                    log::warn!(
-                        "Skipping out-of-range bookmark: {} row {} (file has {} rows)",
-                        abs_path.display(),
-                        bookmark.row,
-                        max_point.row
-                    );
-                    return None;
-                }
-
-                let anchor = snapshot.anchor_after(point);
                 Some(Bookmark {
-                    anchor,
+                    anchor: snapshot.anchor_after(Point::new(row, 0)),
                     label: bookmark.label.clone(),
+                    pending_source_location,
                 })
             })
             .collect();
@@ -230,7 +281,11 @@ impl BookmarkStore {
                 self.bookmarks.remove(&abs_path);
             }
         } else {
-            buffer_bookmarks.bookmarks.push(Bookmark { anchor, label });
+            buffer_bookmarks.bookmarks.push(Bookmark {
+                anchor,
+                label,
+                pending_source_location: None,
+            });
         }
 
         cx.notify();
@@ -384,6 +439,109 @@ impl BookmarkStore {
         }
     }
 
+    fn handle_language_changed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let (has_language, is_parsing) = {
+            let buffer = buffer.read(cx);
+            let mut parse_status = buffer.parse_status();
+            (
+                buffer.language().is_some(),
+                *parse_status.borrow() == ParseStatus::Parsing,
+            )
+        };
+        if !has_language {
+            return;
+        }
+        if is_parsing {
+            if let Some(buffer_bookmarks) = self.buffer_bookmarks_mut(&buffer) {
+                buffer_bookmarks.needs_reserialization_after_reparse = true;
+            }
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn handle_reparsed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let (syntax_is_available, is_parsing) = {
+            let buffer = buffer.read(cx);
+            let mut parse_status = buffer.parse_status();
+            (
+                buffer
+                    .language()
+                    .is_some_and(|language| language != &*PLAIN_TEXT),
+                *parse_status.borrow() == ParseStatus::Parsing,
+            )
+        };
+        if !syntax_is_available || is_parsing {
+            return;
+        }
+        let Some(buffer_bookmarks) = self.buffer_bookmarks_mut(&buffer) else {
+            return;
+        };
+        let should_notify = buffer_bookmarks.needs_reserialization_after_reparse
+            || buffer_bookmarks
+                .bookmarks
+                .iter()
+                .any(|bookmark| bookmark.pending_source_location.is_some());
+        buffer_bookmarks.needs_reserialization_after_reparse = false;
+
+        if should_notify {
+            self.resolve_pending_source_locations(&buffer, cx);
+            cx.notify();
+        }
+    }
+
+    fn resolve_pending_source_locations(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let resolver = SourceLocationResolver::for_buffer(buffer.read(cx));
+        let snapshot = buffer.read(cx).snapshot();
+        let Some(buffer_bookmarks) = self.buffer_bookmarks_mut(buffer) else {
+            return;
+        };
+
+        for bookmark in &mut buffer_bookmarks.bookmarks {
+            let Some(mut pending) = bookmark.pending_source_location.take() else {
+                continue;
+            };
+            if let Some(row) = resolver.row_for_anchor(bookmark.anchor) {
+                pending.row = row;
+            }
+            let row = match resolver.resolve(&pending) {
+                Ok(SourceLocationResolution::Resolved { row, .. }) => Some(row),
+                Ok(SourceLocationResolution::Deferred { .. }) => {
+                    bookmark.pending_source_location = Some(pending);
+                    None
+                }
+                Ok(SourceLocationResolution::Unresolvable) => None,
+                Err(error) => {
+                    log::warn!("Ignoring invalid pending source location: {error:#}");
+                    match resolver.resolve_row(pending.row) {
+                        SourceLocationResolution::Resolved { row, .. } => Some(row),
+                        SourceLocationResolution::Deferred { .. }
+                        | SourceLocationResolution::Unresolvable => None,
+                    }
+                }
+            };
+            if let Some(row) = row {
+                bookmark.anchor = snapshot.anchor_after(Point::new(row, 0));
+            }
+        }
+    }
+
+    fn buffer_bookmarks_mut(&mut self, buffer: &Entity<Buffer>) -> Option<&mut BufferBookmarks> {
+        let entity_id = buffer.entity_id();
+        self.bookmarks.values_mut().find_map(|entry| match entry {
+            BookmarkEntry::Loaded(buffer_bookmarks)
+                if buffer_bookmarks.buffer.entity_id() == entity_id =>
+            {
+                Some(buffer_bookmarks)
+            }
+            BookmarkEntry::Loaded(_) | BookmarkEntry::Unloaded(_) => None,
+        })
+    }
+
     pub fn all_serialized_bookmarks(
         &self,
         cx: &App,
@@ -394,21 +552,31 @@ impl BookmarkStore {
                 let mut rows = match entry {
                     BookmarkEntry::Unloaded(rows) => rows.clone(),
                     BookmarkEntry::Loaded(buffer_bookmarks) => {
-                        let snapshot = buffer_bookmarks.buffer.read(cx).snapshot();
+                        let resolver =
+                            SourceLocationResolver::for_buffer(buffer_bookmarks.buffer.read(cx));
                         buffer_bookmarks
                             .bookmarks
                             .iter()
                             .filter_map(|bookmark| {
-                                if !snapshot.can_resolve(&bookmark.anchor) {
-                                    return None;
+                                if let Some(pending) = &bookmark.pending_source_location {
+                                    let mut pending = pending.clone();
+                                    pending.row = resolver.row_for_anchor(bookmark.anchor)?;
+                                    return Some(SerializedBookmark::from_source_location(
+                                        pending,
+                                        bookmark.label.clone(),
+                                    ));
                                 }
-                                let row =
-                                    snapshot.summary_for_anchor::<Point>(&bookmark.anchor).row;
-                                Some(SerializedBookmark {
-                                    row,
-                                    label: bookmark.label.clone(),
-                                    syntactic_location: None,
-                                })
+                                let source_location =
+                                    match resolver.serialize_anchor(bookmark.anchor)? {
+                                        SourceLocationSerialization::Complete(source_location)
+                                        | SourceLocationSerialization::Provisional(
+                                            source_location,
+                                        ) => source_location,
+                                    };
+                                Some(SerializedBookmark::from_source_location(
+                                    source_location,
+                                    bookmark.label.clone(),
+                                ))
                             })
                             .collect()
                     }
