@@ -196,6 +196,7 @@ impl WaylandSurfaceState {
             return Ok(WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
                 layer_surface,
                 anchor: options.anchor,
+                requested_size: params.bounds.size,
             }));
         }
 
@@ -306,6 +307,7 @@ pub struct WaylandXdgSurfaceState {
 pub struct WaylandLayerSurfaceState {
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     anchor: Anchor,
+    requested_size: Size<Pixels>,
 }
 
 pub struct WaylandPopupSurfaceState {
@@ -731,6 +733,86 @@ mod presentation_state_tests {
         assert!(!PresentationState::Presented.requires_presentation());
         assert!(PresentationState::RetryBeforeFirstPresent.requires_presentation());
         assert!(PresentationState::RetryAfterPresent.requires_presentation());
+    }
+}
+
+#[cfg(test)]
+mod layer_surface_configure_tests {
+    use super::{WaylandWindowStatePtr, px, size};
+
+    #[test]
+    fn fixed_height_survives_compositor_configures() {
+        let requested_size = size(px(0.0), px(38.0));
+        let configured_sizes = [(2560, 1440), (2560, 38), (2560, 1440)];
+        let resulting_sizes = configured_sizes.map(|(width, height)| {
+            WaylandWindowStatePtr::layer_surface_configure_size(requested_size, width, height)
+        });
+
+        assert_eq!(resulting_sizes, [Some(size(px(2560.0), px(38.0))); 3]);
+    }
+
+    #[test]
+    fn configured_size_only_supplies_unspecified_dimensions() {
+        let configured_width = 2560;
+        let configured_height = 1440;
+
+        assert_eq!(
+            WaylandWindowStatePtr::layer_surface_configure_size(
+                size(px(200.0), px(0.0)),
+                configured_width,
+                configured_height,
+            ),
+            Some(size(px(200.0), px(1440.0)))
+        );
+        assert_eq!(
+            WaylandWindowStatePtr::layer_surface_configure_size(
+                size(px(200.0), px(38.0)),
+                configured_width,
+                configured_height,
+            ),
+            Some(size(px(200.0), px(38.0)))
+        );
+        assert_eq!(
+            WaylandWindowStatePtr::layer_surface_configure_size(
+                size(px(0.0), px(38.0)),
+                configured_width,
+                0,
+            ),
+            Some(size(px(2560.0), px(38.0)))
+        );
+        assert_eq!(
+            WaylandWindowStatePtr::layer_surface_configure_size(
+                size(px(0.0), px(38.0)),
+                0,
+                configured_height,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn changed_requested_dimensions_control_later_configures() {
+        let configured_width = 2560;
+        let configured_height = 1440;
+        let mut requested_size = size(px(0.0), px(38.0));
+
+        assert_eq!(
+            WaylandWindowStatePtr::layer_surface_configure_size(
+                requested_size,
+                configured_width,
+                configured_height,
+            ),
+            Some(size(px(2560.0), px(38.0)))
+        );
+        requested_size = size(px(300.0), px(48.0));
+        assert_eq!(
+            WaylandWindowStatePtr::layer_surface_configure_size(
+                requested_size,
+                configured_width,
+                configured_height,
+            ),
+            Some(requested_size)
+        );
     }
 }
 
@@ -1303,6 +1385,30 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    fn layer_surface_configure_size(
+        requested_size: Size<Pixels>,
+        width: u32,
+        height: u32,
+    ) -> Option<Size<Pixels>> {
+        let size = size(
+            if requested_size.width > px(0.0) {
+                requested_size.width
+            } else {
+                px(width as f32)
+            },
+            if requested_size.height > px(0.0) {
+                requested_size.height
+            } else {
+                px(height as f32)
+            },
+        );
+        if size.width <= px(0.0) || size.height <= px(0.0) {
+            None
+        } else {
+            Some(size)
+        }
+    }
+
     pub fn handle_layersurface_event(&self, event: zwlr_layer_surface_v1::Event) -> bool {
         match event {
             zwlr_layer_surface_v1::Event::Configure {
@@ -1310,13 +1416,12 @@ impl WaylandWindowStatePtr {
                 height,
                 serial,
             } => {
-                let size = if width == 0 || height == 0 {
-                    None
-                } else {
-                    Some(size(px(width as f32), px(height as f32)))
-                };
-
                 let mut state = self.state.borrow_mut();
+                let WaylandSurfaceState::LayerShell(layer_surface) = &state.surface_state else {
+                    return false;
+                };
+                let size =
+                    Self::layer_surface_configure_size(layer_surface.requested_size, width, height);
                 state.in_progress_configure = Some(InProgressConfigure {
                     size,
                     fullscreen: false,
@@ -1684,7 +1789,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
         let state_ptr = self.0.clone();
 
         // A popup's placement is the compositor's, so a resize re-runs the positioner and the
@@ -1718,6 +1823,9 @@ impl PlatformWindow for WaylandWindow {
         .map(|v| f32::from(v) as i32)
         .map_size(|v| if v <= 0 { 1 } else { v });
 
+        if let WaylandSurfaceState::LayerShell(layer_surface) = &mut state.surface_state {
+            layer_surface.requested_size = size;
+        }
         state.surface_state.set_geometry(
             window_geometry.origin.x,
             window_geometry.origin.y,
