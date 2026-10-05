@@ -848,6 +848,45 @@ mod layer_shell_size_tests {
     }
 }
 
+fn viewport_destination(size: Size<Pixels>) -> Option<Size<i32>> {
+    let destination = size.map(|dimension| f32::from(dimension) as i32);
+    (destination.width > 0 && destination.height > 0).then_some(destination)
+}
+
+#[cfg(test)]
+mod viewport_destination_tests {
+    use super::viewport_destination;
+    use gpui::{px, size};
+
+    #[test]
+    fn waits_for_compositor_assigned_dimensions() {
+        assert_eq!(viewport_destination(size(px(0.), px(38.))), None);
+        assert_eq!(viewport_destination(size(px(38.), px(0.))), None);
+        assert_eq!(viewport_destination(size(px(0.), px(0.))), None);
+        assert_eq!(
+            viewport_destination(size(px(2115.), px(38.))),
+            Some(size(2115, 38))
+        );
+    }
+
+    #[test]
+    fn rejects_dimensions_that_are_nonpositive_after_conversion() {
+        for dimension in [-1., 0., 0.5] {
+            assert_eq!(viewport_destination(size(px(dimension), px(38.))), None);
+            assert_eq!(viewport_destination(size(px(38.), px(dimension))), None);
+        }
+    }
+
+    #[test]
+    fn preserves_positive_destination_dimensions() {
+        assert_eq!(viewport_destination(size(px(1.), px(1.))), Some(size(1, 1)));
+        assert_eq!(
+            viewport_destination(size(px(500.5), px(200.5))),
+            Some(size(500, 200))
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameLoop {
     Unconfigured,
@@ -1586,7 +1625,7 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
-        let (size, scale) = {
+        let (size, scale, destination) = {
             let mut state = self.state.borrow_mut();
             if size.is_none_or(|size| size == state.bounds.size)
                 && scale.is_none_or(|scale| scale == state.scale)
@@ -1599,9 +1638,15 @@ impl WaylandWindowStatePtr {
             if let Some(scale) = scale {
                 state.scale = scale;
             }
+            // Layer-shell may delegate either dimension to the compositor. A scale
+            // event can precede the first configure; retain it, but do not publish
+            // unresolved dimensions to the renderer, resize callback, or viewporter.
+            let Some(destination) = viewport_destination(state.bounds.size) else {
+                return;
+            };
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
-            (state.bounds.size, state.scale)
+            (state.bounds.size, state.scale, destination)
         };
 
         let callback = self.callbacks.borrow_mut().resize.take();
@@ -1613,8 +1658,7 @@ impl WaylandWindowStatePtr {
         {
             let state = self.state.borrow();
             if let Some(viewport) = &state.viewport {
-                viewport
-                    .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+                viewport.set_destination(destination.width, destination.height);
             }
         }
     }
