@@ -336,6 +336,7 @@ pub(crate) struct WaylandClientState {
     outputs: HashMap<ObjectId, Output>,
     in_progress_outputs: HashMap<ObjectId, InProgressOutput>,
     wl_outputs: HashMap<ObjectId, wl_output::WlOutput>,
+    output_globals: HashMap<u32, ObjectId>,
     keyboard_layout: LinuxKeyboardLayout,
     keymap_state: Option<xkb::State>,
     compose_state: Option<xkb::compose::State>,
@@ -819,6 +820,19 @@ fn wl_seat_version(version: u32) -> u32 {
     version.clamp(WL_SEAT_MIN_VERSION, WL_SEAT_MAX_VERSION)
 }
 
+fn resolve_window_output<T>(
+    kind: &WindowKind,
+    display_id: Option<DisplayId>,
+    resolve: impl FnOnce(DisplayId) -> Option<T>,
+) -> anyhow::Result<Option<T>> {
+    let output = display_id.and_then(resolve);
+    // A null layer-shell output lets the compositor choose another display.
+    if matches!(kind, WindowKind::LayerShell(_)) && display_id.is_some() && output.is_none() {
+        anyhow::bail!("Requested layer-shell display is no longer available");
+    }
+    Ok(output)
+}
+
 fn wl_output_version(version: u32) -> u32 {
     const WL_OUTPUT_MIN_VERSION: u32 = 2;
     const WL_OUTPUT_MAX_VERSION: u32 = 4;
@@ -846,6 +860,7 @@ impl WaylandClient {
         let mut in_progress_outputs = HashMap::default();
         #[allow(clippy::mutable_key_type)]
         let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
+        let mut output_globals = HashMap::default();
         globals.contents().with_list(|list| {
             for global in list {
                 match &global.interface[..] {
@@ -865,6 +880,7 @@ impl WaylandClient {
                             (),
                         );
                         in_progress_outputs.insert(output.id(), InProgressOutput::default());
+                        output_globals.insert(global.name, output.id());
                         wl_outputs.insert(output.id(), output);
                     }
                     _ => {}
@@ -1005,6 +1021,7 @@ impl WaylandClient {
             outputs: HashMap::default(),
             in_progress_outputs,
             wl_outputs,
+            output_globals,
             windows: HashMap::default(),
             common,
             keyboard_layout: LinuxKeyboardLayout::new(UNKNOWN_KEYBOARD_LAYOUT_NAME),
@@ -1159,14 +1176,14 @@ impl LinuxClient for WaylandClient {
             _ => (state.keyboard_focused_window.clone(), None),
         };
 
-        let target_output = params.display_id.and_then(|display_id| {
+        let target_output = resolve_window_output(&params.kind, params.display_id, |display_id| {
             let target_protocol_id: u64 = display_id.into();
             state
                 .wl_outputs
                 .iter()
                 .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
                 .map(|(_, output)| output.clone())
-        });
+        })?;
 
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
@@ -1495,12 +1512,21 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     state
                         .in_progress_outputs
                         .insert(output.id(), InProgressOutput::default());
+                    state.output_globals.insert(name, output.id());
                     state.wl_outputs.insert(output.id(), output);
                 }
                 _ => {}
             },
-            wl_registry::Event::GlobalRemove { name: _ } => {
-                // TODO: handle global removal
+            wl_registry::Event::GlobalRemove { name } => {
+                if let Some(output_id) = state.output_globals.remove(&name) {
+                    state.outputs.remove(&output_id);
+                    state.in_progress_outputs.remove(&output_id);
+                    if let Some(output) = state.wl_outputs.remove(&output_id)
+                        && output.version() >= 3
+                    {
+                        output.release();
+                    }
+                }
             }
             _ => {}
         }
@@ -2979,6 +3005,32 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn layer_shell_output_requires_explicit_target_to_exist() {
+        let kind = WindowKind::LayerShell(Default::default());
+        let display = DisplayId::from(42);
+        assert!(resolve_window_output::<()>(&kind, Some(display), |_| None).is_err());
+        assert_eq!(
+            resolve_window_output(&kind, Some(display), |target| Some(u64::from(target)))
+                .expect("target exists"),
+            Some(42),
+        );
+        assert_eq!(
+            resolve_window_output::<()>(&kind, None, |_| panic!("no target requested"))
+                .expect("compositor may choose the output"),
+            None,
+        );
+    }
+
+    #[test]
+    fn ordinary_window_preserves_missing_output_fallback() {
+        assert_eq!(
+            resolve_window_output::<()>(&WindowKind::Normal, Some(DisplayId::from(42)), |_| None)
+                .expect("ordinary window placement is unchanged"),
+            None,
+        );
+    }
 
     #[derive(Clone)]
     struct FakeDataOffer {
