@@ -34,7 +34,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
@@ -101,7 +101,8 @@ use gpui::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
+    Size, TouchEvent, TouchId, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
+    profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -319,6 +320,8 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
+    wl_touch: Option<wl_touch::WlTouch>,
+    touches: TouchContacts<ObjectId>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -707,6 +710,10 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
+        state
+            .touches
+            .active
+            .retain(|_, (surface, _)| surface != surface_id);
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
         {
@@ -787,6 +794,9 @@ impl Drop for WaylandClient {
         let mut state = self.0.borrow_mut();
         state.windows.clear();
 
+        if let Some(touch) = state.wl_touch.take() {
+            touch.release();
+        }
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
         }
@@ -991,6 +1001,8 @@ impl WaylandClient {
             compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
+            wl_touch: None,
+            touches: TouchContacts::new(),
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -1483,6 +1495,12 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         qh,
                         (),
                     );
+                    if let Some(touch) = state.wl_touch.take() {
+                        touch.release();
+                        let cancelled = state.touches.cancel();
+                        drop(state);
+                        this.deliver_touches(cancelled);
+                    }
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
@@ -1768,7 +1786,7 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
 
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
     fn event(
-        state: &mut Self,
+        this: &mut Self,
         seat: &wl_seat::WlSeat,
         event: wl_seat::Event,
         _: &(),
@@ -1779,8 +1797,11 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            let client = state.get_client();
+            let client = this.get_client();
             let mut state = client.borrow_mut();
+            if seat != &state.wl_seat {
+                return;
+            }
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 let keyboard = seat.get_keyboard(qh, ());
 
@@ -1827,7 +1848,147 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 state.wl_pointer = Some(pointer);
             }
+            if capabilities.contains(wl_seat::Capability::Touch) {
+                state.wl_touch.get_or_insert_with(|| seat.get_touch(qh, ()));
+            } else if let Some(touch) = state.wl_touch.take() {
+                touch.release();
+                let cancelled = state.touches.cancel();
+                drop(state);
+                this.deliver_touches(cancelled);
+            }
         }
+    }
+}
+
+enum TouchUpdate<S> {
+    Down(i32, S, Point<Pixels>),
+    Motion(i32, Point<Pixels>),
+    Up(i32),
+}
+
+struct TouchContacts<S> {
+    // wl_touch IDs can be reused after up. GPUI IDs must not be.
+    next_id: u64,
+    active: HashMap<i32, (S, TouchEvent)>,
+    frame: Vec<TouchUpdate<S>>,
+}
+
+impl<S: Clone> TouchContacts<S> {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            active: HashMap::default(),
+            frame: Vec::new(),
+        }
+    }
+
+    fn finish_frame(&mut self) -> Vec<(S, TouchEvent)> {
+        self.frame
+            .drain(..)
+            .filter_map(|update| match update {
+                TouchUpdate::Down(id, surface, position) => {
+                    let event = TouchEvent {
+                        id: TouchId(self.next_id),
+                        phase: TouchPhase::Started,
+                        position,
+                        ..Default::default()
+                    };
+                    self.next_id += 1;
+                    let contact = (surface, event);
+                    self.active.insert(id, contact.clone());
+                    Some(contact)
+                }
+                TouchUpdate::Motion(id, position) => {
+                    let contact = self.active.get_mut(&id)?;
+                    contact.1.phase = TouchPhase::Moved;
+                    contact.1.position = position;
+                    Some(contact.clone())
+                }
+                TouchUpdate::Up(id) => {
+                    let (surface, mut event) = self.active.remove(&id)?;
+                    event.phase = TouchPhase::Ended;
+                    Some((surface, event))
+                }
+            })
+            .collect()
+    }
+
+    fn cancel(&mut self) -> Vec<(S, TouchEvent)> {
+        // Cancel supersedes an unfinished frame, including an up that would
+        // otherwise commit a tap. Only unwind contacts GPUI has already seen.
+        self.frame.clear();
+        self.active
+            .drain()
+            .map(|(_, (surface, mut event))| {
+                event.phase = TouchPhase::Cancelled;
+                (surface, event)
+            })
+            .collect()
+    }
+}
+
+impl WaylandClientStatePtr {
+    fn deliver_touches(&self, events: Vec<(ObjectId, TouchEvent)>) {
+        let client = self.get_client();
+        for (surface, event) in events {
+            let window = client.borrow().windows.get(&surface).cloned();
+            if let Some(window) = window {
+                window.handle_input(PlatformInput::Touch(event));
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        touch: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        if state.wl_touch.as_ref() != Some(touch) {
+            return;
+        }
+        let events = match event {
+            wl_touch::Event::Down {
+                serial,
+                surface,
+                id,
+                x,
+                y,
+                ..
+            } => {
+                if state.windows.contains_key(&surface.id()) {
+                    state.serial_tracker.update(SerialKind::MousePress, serial);
+                    state.touches.frame.push(TouchUpdate::Down(
+                        id,
+                        surface.id(),
+                        point(px(x as f32), px(y as f32)),
+                    ));
+                }
+                return;
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                state
+                    .touches
+                    .frame
+                    .push(TouchUpdate::Motion(id, point(px(x as f32), px(y as f32))));
+                return;
+            }
+            wl_touch::Event::Up { id, .. } => {
+                state.touches.frame.push(TouchUpdate::Up(id));
+                return;
+            }
+            wl_touch::Event::Frame => state.touches.finish_frame(),
+            wl_touch::Event::Cancel => state.touches.cancel(),
+            _ => return,
+        };
+        drop(state);
+        this.deliver_touches(events);
     }
 }
 
@@ -2979,6 +3140,60 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn touch_tracks_starting_surface_and_recycled_ids() {
+        let mut touches = TouchContacts::new();
+        let start = point(px(2.5), px(5.));
+        let moved = point(px(2.5), px(25.));
+        touches.frame.extend([
+            TouchUpdate::Down(0, "first", start),
+            TouchUpdate::Down(1, "second", start),
+        ]);
+        let down = touches.finish_frame();
+        let [(.., first), (.., second)] = down.as_slice() else {
+            panic!("expected two contacts")
+        };
+        assert_ne!(first.id, second.id);
+        touches.frame.extend([
+            TouchUpdate::Motion(0, moved),
+            TouchUpdate::Up(0),
+            TouchUpdate::Down(0, "second", start),
+        ]);
+        let updates = touches.finish_frame();
+        let [(a, motion), (b, up), (c, reused)] = updates.as_slice() else {
+            panic!("expected motion, up and down")
+        };
+        assert_eq!((*a, *b, *c), ("first", "first", "second"));
+        assert_eq!(
+            (motion.phase, up.phase, reused.phase),
+            (TouchPhase::Moved, TouchPhase::Ended, TouchPhase::Started)
+        );
+        assert_eq!((motion.id, up.id, up.position), (first.id, first.id, moved));
+        assert_ne!(reused.id, first.id);
+    }
+
+    #[test]
+    fn touch_cancel_supersedes_an_unfinished_frame() {
+        let mut touches = TouchContacts::new();
+        touches
+            .frame
+            .push(TouchUpdate::Down(7, "first", Point::default()));
+        let down = touches.finish_frame();
+        touches.frame.push(TouchUpdate::Up(7));
+        touches
+            .frame
+            .push(TouchUpdate::Down(8, "second", Point::default()));
+        let cancelled = touches.cancel();
+        let [(_, event)] = cancelled.as_slice() else {
+            panic!("cancel only delivered contacts")
+        };
+        assert_eq!(event.id, down.first().expect("one contact").1.id);
+        assert_eq!(event.phase, TouchPhase::Cancelled);
+        touches.frame.push(TouchUpdate::Up(8));
+        assert!(touches.finish_frame().is_empty());
+        assert!(touches.cancel().is_empty());
+    }
 
     #[derive(Clone)]
     struct FakeDataOffer {

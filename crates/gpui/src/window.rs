@@ -8628,6 +8628,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn touch_clicks_button_once_but_not_after_pan_or_cancel(cx: &mut TestAppContext) {
+        struct Button(Rc<Cell<usize>>);
+        impl Render for Button {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.0.clone();
+                div()
+                    .id("button")
+                    .size_full()
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+            }
+        }
+        let clicks = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            move |_, _| Button(clicks)
+        });
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        assert_eq!(clicks.get(), 0);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
+        assert_eq!(clicks.get(), 1);
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Cancelled, 10.);
+        dispatch_touch(window, cx, TouchId(3), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(3), TouchPhase::Moved, 70.);
+        dispatch_touch(window, cx, TouchId(3), TouchPhase::Ended, 75.);
+        assert_eq!(clicks.get(), 1);
+    }
+
+    #[gpui::test]
     fn claimed_touch_drag_receives_movement_and_release(cx: &mut TestAppContext) {
         let events = Rc::new(RefCell::new(Vec::new()));
         let window = cx.add_window({
